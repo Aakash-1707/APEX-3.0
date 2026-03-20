@@ -251,9 +251,13 @@ export function RacePredictionTab({ raceSessionKey, drivers, mode, predictions, 
         <div style={{display:"grid",gridTemplateColumns:mobile?"repeat(2,1fr)":"repeat(4,1fr)",gap:"8px",marginBottom:"16px"}}>
           {[
             {l:"SIMULATIONS",v:(modelMeta.n_sims||100000).toLocaleString(),c:T.red},
+            {l:"RACE LAPS",v:`${modelMeta.race_laps||56}`,c:T.accent},
             {l:"SC PROBABILITY",v:`${((modelMeta.sc_probability||0)*100).toFixed(0)}%`,c:T.yellow},
             {l:"RAIN PROBABILITY",v:`${((modelMeta.rain_probability||0)*100).toFixed(0)}%`,c:T.blue},
+            {l:"PIT LOSS",v:`${(modelMeta.pit_loss_seconds||22).toFixed(1)}s`,c:"#ff9100"},
+            {l:"OVERTAKE DIFF",v:`${((modelMeta.overtake_difficulty||0.45)*100).toFixed(0)}%`,c:T.green},
             {l:"OVERTAKE FACTOR",v:`${modelMeta.overtake_factor||1.4}x`,c:T.green},
+            {l:"SIM TYPE",v:modelMeta.simulation_type==="lap_by_lap_strategy"?"LAP-BY-LAP":"AGGREGATE",c:"#e040fb"},
           ].map(m=>(
             <Card key={m.l} style={{padding:mobile?"8px 10px":"10px 12px"}}>
               <div style={{fontFamily:T.fontMono,fontSize:mobile?"9px":"8px",letterSpacing:"2px",color:T.dim2,marginBottom:"4px"}}>{m.l}</div>
@@ -289,7 +293,7 @@ export function RacePredictionTab({ raceSessionKey, drivers, mode, predictions, 
           )}
         </div>
         <div style={{overflowX:mobile?"auto":"visible",WebkitOverflowScrolling:"touch"}}>
-        <div style={{minWidth:mobile?"600px":undefined}}>
+        <div style={{minWidth:mobile?"660px":undefined}}>
         {/* Table header */}
         <div style={{display:"flex",alignItems:"center",gap:"10px",padding:"6px 12px",
           borderBottom:`2px solid ${T.border2}`,marginBottom:"4px"}}>
@@ -300,6 +304,7 @@ export function RacePredictionTab({ raceSessionKey, drivers, mode, predictions, 
           <span style={{fontFamily:T.fontMono,fontSize:"8px",color:T.dim2,letterSpacing:"2px",width:"55px",textAlign:"right"}}>WIN %</span>
           <span style={{fontFamily:T.fontMono,fontSize:"8px",color:T.dim2,letterSpacing:"2px",width:"55px",textAlign:"right"}}>PODIUM</span>
           <span style={{fontFamily:T.fontMono,fontSize:"8px",color:T.dim2,letterSpacing:"2px",width:"55px",textAlign:"right"}}>POINTS</span>
+          <span style={{fontFamily:T.fontMono,fontSize:"8px",color:T.dim2,letterSpacing:"2px",width:"50px",textAlign:"right"}}>AVG FIN</span>
           <span style={{fontFamily:T.fontMono,fontSize:"8px",color:T.dim2,letterSpacing:"2px",width:"45px",textAlign:"right"}}>DNF</span>
         </div>
 
@@ -351,6 +356,12 @@ export function RacePredictionTab({ raceSessionKey, drivers, mode, predictions, 
               </div>
               <div style={{width:"55px",textAlign:"right"}}>
                 <span style={{fontFamily:T.fontMono,fontSize:"11px",color:T.green}}>{p.points_pct}%</span>
+              </div>
+              <div style={{width:"50px",textAlign:"right"}}>
+                <span style={{fontFamily:T.fontDisplay,fontSize:"12px",fontWeight:700,
+                  color:p.avg_finish<=3?"#00e5ff":p.avg_finish<=10?T.accent:T.dim2}}>
+                  P{p.avg_finish||"—"}
+                </span>
               </div>
               <div style={{width:"45px",textAlign:"right"}}>
                 <span style={{fontFamily:T.fontMono,fontSize:"11px",color:p.dnf_pct>10?T.red:T.dim2}}>{p.dnf_pct}%</span>

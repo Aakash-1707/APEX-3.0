@@ -2,6 +2,19 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { T, apiFetch, Card, SectionHeader, Spinner, ErrorBanner, useIsMobile } from "./theme";
 
+/** Same rules as Chart.js dataset build: in-range laps only, pit-out excluded, duration or full sectors. */
+function lapHasPlottedTime(l, maxLap) {
+  if (!l || l.is_pit_out) return false;
+  const n = l.lap_number;
+  if (n == null || n < 1 || n > maxLap) return false;
+  let duration = l.lap_duration;
+  if (!duration || duration <= 0) {
+    const s1 = l.s1, s2 = l.s2, s3 = l.s3;
+    if (s1 != null && s2 != null && s3 != null) duration = s1 + s2 + s3;
+  }
+  return !!(duration && duration > 0);
+}
+
 export default function TyreDegTab({ sessionKey, drivers, mode }) {
   const mobile = useIsMobile();
   const [stints, setStints] = useState(null);
@@ -43,7 +56,8 @@ export default function TyreDegTab({ sessionKey, drivers, mode }) {
 
   // Chart rendering
   useEffect(() => {
-    if (!stints || !chartRef.current || !drivers?.length) return;
+    // Stint keys drive the chart; drivers only enrich labels (fallback to #number).
+    if (!stints || !chartRef.current) return;
     const script = document.createElement("script");
     script.src = "https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js";
     script.onload = () => {
@@ -55,10 +69,10 @@ export default function TyreDegTab({ sessionKey, drivers, mode }) {
       const datasets = activeDrivers
         .filter(dn => lapData[dn])
         .map((dn, idx) => {
-          const d = drivers.find(dr => dr.driver_number === dn);
+          const d = drivers?.find(dr => dr.driver_number === dn);
           const lapTimes = new Array(maxLap).fill(null);
           (lapData[dn] || []).forEach(l => {
-            if (l.is_pit_out || l.lap_number > maxLap) return;
+            if (!lapHasPlottedTime(l, maxLap)) return;
             let duration = l.lap_duration;
             if (!duration || duration <= 0) {
               const s1 = l.s1, s2 = l.s2, s3 = l.s3;
@@ -110,18 +124,29 @@ export default function TyreDegTab({ sessionKey, drivers, mode }) {
       TYRE DATA AVAILABLE AFTER SESSION
     </div></Card>
   );
-  if (loading) return <Spinner label="Fetching stint data from OpenF1..."/>;
+  if (loading) return <Spinner label="Fetching stint data (OpenF1 → FastF1)..."/>;
   if (error) return <ErrorBanner message={error} onRetry={fetchData}/>;
   if (!stints) return null;
 
   const allDriverNums = Object.keys(stints).map(Number);
+  if (allDriverNums.length === 0) {
+    return (
+      <Card>
+        <div style={{textAlign:"center",padding:"40px",fontFamily:T.fontMono,fontSize:mobile?"11px":"10px",color:T.dim2,letterSpacing:"2px",lineHeight:1.6}}>
+          TYRE / STINT DATA NOT AVAILABLE
+          <div style={{fontSize:"9px",marginTop:"12px",opacity:0.85,letterSpacing:"1px"}}>
+            OpenF1 and FastF1 returned no stint data for this session (session may not be complete or not published).
+          </div>
+        </div>
+      </Card>
+    );
+  }
 
-  const hasAnyLapTimes = allDriverNums.some(dn => (lapData[dn] || []).some(l => {
-    if (l.is_pit_out) return false;
-    if (l.lap_duration && l.lap_duration > 0) return true;
-    const s1 = l.s1, s2 = l.s2, s3 = l.s3;
-    return s1 != null && s2 != null && s3 != null;
-  }));
+  const maxLap = Math.max(...Object.values(stints).flat().map(s => s.lap_end || 0), 1);
+  // Match chart: only active drivers and laps that fall within stint-derived maxLap (see lapHasPlottedTime).
+  const hasAnyLapTimes = activeDrivers.some(dn =>
+    (lapData[dn] || []).some(l => lapHasPlottedTime(l, maxLap)),
+  );
 
   return(
     <div>
@@ -163,7 +188,7 @@ export default function TyreDegTab({ sessionKey, drivers, mode }) {
               <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",
                 background:"rgba(0,0,0,0.3)",fontFamily:T.fontMono,fontSize:mobile?"11px":"10px",color:T.dim2,letterSpacing:"2px",textAlign:"center",padding:24}}>
                 LAP TIMES NOT YET AVAILABLE<br/>
-                <span style={{fontSize:"9px",marginTop:"6px",opacity:0.8}}>OpenF1 may still be processing this session</span>
+                <span style={{fontSize:"9px",marginTop:"6px",opacity:0.8}}>Data may still be processing, or only available from one source</span>
               </div>
             )}
           </div>
@@ -173,7 +198,9 @@ export default function TyreDegTab({ sessionKey, drivers, mode }) {
           <SectionHeader title="Race strategy · tyre compounds"/>
           {allDriverNums.slice(0,10).map(dn => {
             const d = drivers?.find(dr => dr.driver_number === dn);
-            const driverStints = stints[dn] || [];
+            const driverStints = [...(stints[dn] || [])].sort(
+              (a,b) => (a.lap_start||0)-(b.lap_start||0) || (a.stint_number||0)-(b.stint_number||0)
+            );
             return(
               <div key={dn} style={{display:"flex",alignItems:"center",gap:"8px",marginBottom:"8px"}}>
                 <span style={{fontFamily:T.fontMono,fontSize:mobile?"11px":"10px",
@@ -182,14 +209,18 @@ export default function TyreDegTab({ sessionKey, drivers, mode }) {
                   {driverStints.map((s,i) => {
                     const compound = (s.compound||"UNKNOWN").toUpperCase();
                     const color = T.tyres[compound] || T.dim;
+                    const inferred = Boolean(s.inferred_opening);
+                    const tip = inferred
+                      ? `Laps ${s.lap_start}–${s.lap_end}: compound not in OpenF1 (gap filled)`
+                      : `Laps ${s.lap_start}–${s.lap_end}: ${compound}`;
                     return(
-                      <div key={i} style={{
+                      <div key={`${s.lap_start}-${s.lap_end}-${i}`} title={tip} style={{
                         flex:s.laps||1, background:color, borderRadius:"3px",
                         display:"flex",alignItems:"center",justifyContent:"center",
                         fontSize:mobile?"9px":"8px",fontWeight:700,letterSpacing:"0.5px",
                         color:compound==="MEDIUM"||compound==="HARD"?"#000":"#fff",
-                        opacity:0.88,fontFamily:T.fontMono}}>
-                        {compound[0]}{s.laps}
+                        opacity:inferred?0.55:0.88,fontFamily:T.fontMono}}>
+                        {inferred ? `?${s.laps}` : `${compound[0]}${s.laps}`}
                       </div>
                     );
                   })}

@@ -1,12 +1,17 @@
 # Dependencies
 node_modules/
 venv/
+.venv/
 env/
 .env
+.env.local
+.env.*.local
+*.log
 
-# Caches
+# Caches & local data
 apex_backend/prediction_cache/
 apex_backend/f1_cache/
+apex_backend/strategy_data/chroma_db/
 
 # Python
 __pycache__/
@@ -49,6 +54,11 @@ out/
 !.yarn/releases
 !.yarn/sdks
 !.yarn/versions
+
+# IDE
+.idea/
+.vscode/*
+!.vscode/extensions.json
 
 # OS
 .DS_Store

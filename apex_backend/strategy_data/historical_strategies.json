@@ -1,0 +1,160 @@
+{
+  "strategies": [
+    {
+      "id": "bahrain_general",
+      "circuit": "Bahrain",
+      "type": "circuit_profile",
+      "description": "Bahrain is a high degradation circuit. Rear-limited with abrasive surface causing high tyre wear. The pit lane is relatively standard at ~22.5s loss.",
+      "typical_strategy": "Two-stop: SOFT(15-18) → HARD(20-22) → MEDIUM(17-20) or one-stop MEDIUM(25) → HARD(32)",
+      "key_factors": ["high rear degradation", "abrasive surface", "long straights favor hard tyres late", "undercut is powerful due to high deg"]
+    },
+    {
+      "id": "bahrain_2024",
+      "circuit": "Bahrain",
+      "year": 2024,
+      "type": "race_result",
+      "winner": "Max Verstappen",
+      "winning_strategy": "MEDIUM(17) → HARD(21) → MEDIUM(19) — two-stop",
+      "description": "Verstappen dominated with a standard two-stop. High degradation meant one-stop was not viable for frontrunners. SC did not deploy.",
+      "notes": "Leclerc tried extending stint 1 but suffered significant deg drop-off."
+    },
+    {
+      "id": "monaco_general",
+      "circuit": "Monaco",
+      "type": "circuit_profile",
+      "description": "Monaco is a low degradation street circuit where track position is paramount. Overtaking is nearly impossible, making strategy mostly about tyre management. Pit loss is very high at ~24s.",
+      "typical_strategy": "One-stop: MEDIUM(35-40) → HARD(38-43) or HARD(40) → MEDIUM(38). Some attempt no-stop on HARD.",
+      "key_factors": ["track position critical", "overtaking nearly impossible", "high pit loss", "low degradation", "high SC probability 70%"]
+    },
+    {
+      "id": "monaco_2024",
+      "circuit": "Monaco",
+      "year": 2024,
+      "type": "race_result",
+      "winner": "Charles Leclerc",
+      "winning_strategy": "MEDIUM(28) → HARD(50) — one-stop",
+      "description": "Leclerc won his home race from pole. Classic Monaco strategy — maintain track position, one-stop, manage tyres. No real opportunity to undercut due to pit loss.",
+      "notes": "Late SC bunched the field but positions held."
+    },
+    {
+      "id": "silverstone_general",
+      "circuit": "Britain",
+      "type": "circuit_profile",
+      "description": "Silverstone is a high-speed circuit with high energy corners causing significant front-left tyre wear. Weather variability is the biggest strategy wildcard.",
+      "typical_strategy": "Two-stop: SOFT(16-18) → MEDIUM(18-20) → SOFT(14-16) or one-stop MEDIUM(26) → HARD(26)",
+      "key_factors": ["front-left critical", "high speed corners", "weather unpredictable", "rain probability 35%", "undercut effective", "long pit lane"]
+    },
+    {
+      "id": "monza_general",
+      "circuit": "Italy",
+      "type": "circuit_profile",
+      "description": "Monza is the lowest downforce circuit on the calendar. Low tyre degradation due to few slow corners, but very high pit loss (~25s) due to long pit lane.",
+      "typical_strategy": "One-stop: MEDIUM(24-28) → HARD(25-29) or even attempt zero-stop on HARD",
+      "key_factors": ["very high pit loss", "low degradation", "DRS critical for overtaking", "low downforce", "slipstream effect strong"]
+    },
+    {
+      "id": "singapore_general",
+      "circuit": "Singapore",
+      "type": "circuit_profile",
+      "description": "Singapore is a high degradation street circuit with high SC probability (68%). The street surface is aggressive on tyres and the race is physically demanding.",
+      "typical_strategy": "Two-stop: SOFT(15) → MEDIUM(22) → HARD(25) with SC-dependent variants. SC almost always deploys.",
+      "key_factors": ["very high SC probability", "street circuit", "high degradation", "physically demanding", "night race", "track evolution significant"]
+    },
+    {
+      "id": "spa_general",
+      "circuit": "Belgium",
+      "type": "circuit_profile",
+      "description": "Spa is a long lap with varied corners. Low pit loss (~21s) and moderate degradation. Weather can change rapidly with the Ardennes microclimate.",
+      "typical_strategy": "One-stop: MEDIUM(22) → HARD(22) or two-stop with SOFT start if weather stays dry",
+      "key_factors": ["unpredictable weather", "rain probability 40%", "long lap", "low pit loss relative to lap time", "elevation changes affect tyre temps"]
+    },
+    {
+      "id": "jeddah_general",
+      "circuit": "Saudi Arabia",
+      "type": "circuit_profile",
+      "description": "Jeddah is a high-speed street circuit with very high SC probability (65%). Barrier-lined track means incidents are common. Medium-high degradation.",
+      "typical_strategy": "One or two-stop: MEDIUM(18-20) → HARD(30-32) or SOFT(14) → HARD(20) → MEDIUM(16) if SC expected",
+      "key_factors": ["very high SC probability 65%", "high speed street circuit", "barrier proximity", "DRS zones make overtaking possible", "tyre overheating risk"]
+    },
+    {
+      "id": "hungary_general",
+      "circuit": "Hungary",
+      "type": "circuit_profile",
+      "description": "Hungaroring is a tight, twisty circuit where overtaking is very difficult — like Monaco without the glamour. High degradation due to slow corners and hot conditions.",
+      "typical_strategy": "Two-stop: SOFT(18) → MEDIUM(26) → SOFT(26) or MEDIUM(30) → HARD(40) one-stop",
+      "key_factors": ["overtaking very difficult", "track position important", "high degradation in heat", "tyre overheating", "dust off-line"]
+    },
+    {
+      "id": "austin_general",
+      "circuit": "United States",
+      "type": "circuit_profile",
+      "description": "COTA is a balanced circuit with varied corners. Medium degradation with bumpy surface causing tyre vibrations. Standard 56-lap race.",
+      "typical_strategy": "Two-stop: MEDIUM(18) → HARD(20) → SOFT(18) or one-stop MEDIUM(28) → HARD(28)",
+      "key_factors": ["bumpy surface", "medium degradation", "varied corner types", "elevation change at T1", "wind can affect strategy"]
+    },
+    {
+      "id": "baku_general",
+      "circuit": "Azerbaijan",
+      "type": "circuit_profile",
+      "description": "Baku is a street circuit with the longest straight on the calendar. Very high SC probability (72%). Low degradation on most compounds but tyre failures from debris possible.",
+      "typical_strategy": "One-stop: HARD(24) → MEDIUM(27) or two-stop MEDIUM(15) → HARD(20) → SOFT(16) gambling on late SC",
+      "key_factors": ["highest SC probability on calendar", "very long main straight", "DRS overtaking common", "tyre debris risk", "street circuit barriers"]
+    },
+    {
+      "id": "undercut_theory",
+      "circuit": "",
+      "type": "strategy_concept",
+      "description": "The undercut works by pitting before a rival to gain a tyre advantage. Fresh tyres are typically 1-3 seconds per lap faster. The driver behind pits first, does fast out-laps on new tyres, and comes out ahead when the rival eventually pits.",
+      "key_factors": ["tyre delta is key", "pit loss must be overcome by pace advantage", "works best at high-degradation circuits", "driver ahead can respond by counter-pitting"]
+    },
+    {
+      "id": "overcut_theory",
+      "circuit": "",
+      "type": "strategy_concept",
+      "description": "The overcut works by staying out while a rival pits. The driver staying out benefits from clear air and a lighter car (more fuel burned) to set fast laps before pitting. Most effective when the track rubbers in or when out-lap traffic is heavy.",
+      "key_factors": ["clear air advantage", "lighter fuel load", "track evolution", "traffic on out-lap", "risk of tyre cliff"]
+    },
+    {
+      "id": "sc_strategy",
+      "circuit": "",
+      "type": "strategy_concept",
+      "description": "Safety car periods are the most impactful strategy events. Pit loss under SC is reduced by ~15 seconds as the field circulates slowly. Teams that pit during SC gain a 'free' stop. Those who don't pit gain track position but on older tyres.",
+      "key_factors": ["pit loss reduced by ~15s", "field bunches together erasing gaps", "track position vs fresh tyres trade-off", "timing of SC matters hugely", "double-stacking can lose time"]
+    },
+    {
+      "id": "vsc_strategy",
+      "circuit": "",
+      "type": "strategy_concept",
+      "description": "Virtual Safety Car reduces pit loss by about 10 seconds compared to normal racing. Less impactful than full SC but still creates a strategic opportunity. The field maintains gaps proportionally rather than bunching.",
+      "key_factors": ["pit loss reduced by ~10s", "gaps maintained proportionally", "less disruptive than full SC", "quick decision needed"]
+    },
+    {
+      "id": "rain_strategy",
+      "circuit": "",
+      "type": "strategy_concept",
+      "description": "Rain forces a switch to intermediate or wet tyres. Timing the switch is critical — too early means slow laps on a drying track, too late means aquaplaning risk. Crossover point between slicks and inters varies by 3-5 seconds depending on rain intensity.",
+      "key_factors": ["tyre crossover point", "drying track favors slicks", "aquaplaning risk", "intermediates in light rain", "full wets in heavy rain", "multiple transitions possible"]
+    },
+    {
+      "id": "mercedes_tendency",
+      "circuit": "",
+      "type": "team_tendency",
+      "description": "Mercedes historically tends to overcut, preferring track position and clear air. They manage tyres well in long stints and often extend stints beyond the expected window.",
+      "key_factors": ["overcut preference", "strong tyre management", "tends to extend stints", "conservative first pit window"]
+    },
+    {
+      "id": "redbull_tendency",
+      "circuit": "",
+      "type": "team_tendency",
+      "description": "Red Bull historically favors the undercut, often pitting aggressively to gain track position. Under Verstappen, they are decisive and rarely wait. Strong in traffic management.",
+      "key_factors": ["undercut preference", "aggressive pit timing", "strong in dirty air", "decisive strategy calls"]
+    },
+    {
+      "id": "ferrari_tendency",
+      "circuit": "",
+      "type": "team_tendency",
+      "description": "Ferrari has historically been inconsistent with strategy, sometimes making conservative calls that cost positions. However, they have strong race pace and can recover from suboptimal strategy through raw speed.",
+      "key_factors": ["sometimes conservative", "strong raw pace", "occasional strategic errors", "improving under new management"]
+    }
+  ]
+}

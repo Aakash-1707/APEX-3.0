@@ -1,7 +1,9 @@
 """
-APEX Backend API — OpenF1 Edition
+APEX Backend API — OpenF1 + FastF1
 ==================================
-FastAPI server that proxies OpenF1 REST API and runs Monte Carlo predictions.
+FastAPI server that prefers OpenF1 REST API and falls back to FastF1 (local Ergast/F1
+data) when OpenF1 returns no data for sessions, drivers, laps, stints, results, or
+telemetry. Install FastF1: pip install fastf1
 
 Run:
     pip install fastapi uvicorn httpx numpy
@@ -33,6 +35,10 @@ import time as _time
 from datetime import datetime, timezone
 
 import model_core as mc
+import strategy_engine as se
+import ff_bridge as fb
+from rag_service import get_rag
+from llm_service import get_llm
 
 OPENF1_BASE = "https://api.openf1.org/v1"
 
@@ -217,6 +223,32 @@ def health():
 
 # ─── CALENDAR ─────────────────────────────────────────────────────────────────
 
+def _mark_cancelled_races_after_japan(events: list) -> None:
+    """
+    Mark Bahrain and Saudi Arabian GPs as cancelled when they fall after the Japanese GP
+    on the calendar (by date order). Matches by event / circuit name so a different race
+    between Japan and those rounds is not marked by mistake.
+    """
+    jp_i = None
+    for i, e in enumerate(events):
+        n = (e.get("name") or "").lower()
+        c = (e.get("circuit_short_name") or "").lower()
+        if "japanese" in n or ("japan" in n and "grand" in n) or "suzuka" in c:
+            jp_i = i
+            break
+    if jp_i is None:
+        return
+    marked = 0
+    for e in events[jp_i + 1 :]:
+        if marked >= 2:
+            break
+        n = (e.get("name") or "").lower()
+        c = (e.get("circuit_short_name") or "").lower()
+        if "bahrain" in n or "saudi" in n or "jeddah" in c:
+            e["cancelled"] = True
+            marked += 1
+
+
 @app.get("/api/calendar")
 def get_calendar(year: int = Query(2026)):
     """Fetch race calendar from OpenF1, excluding testing events."""
@@ -304,7 +336,12 @@ def get_calendar(year: int = Query(2026)):
             "gmt_offset":   m.get("gmt_offset", ""),
             "year":         year,
             "mode":         mode,
+            "cancelled":    False,
         })
+
+    output.sort(key=lambda x: x.get("date_start") or "")
+    if year == 2026:
+        _mark_cancelled_races_after_japan(output)
 
     return output
 
@@ -321,6 +358,21 @@ def get_sessions(meeting_key: int):
 
     if not isinstance(sessions, list):
         sessions = []
+
+    # OpenF1 occasionally returns [] for sessions?meeting_key=X even when the meeting exists.
+    # Pull year-scoped sessions and filter (cached per year) so rounds like Australia work reliably.
+    if not sessions:
+        for yr in (2026, 2025, 2024):
+            try:
+                year_sessions = _openf1("sessions", {"year": yr}, ttl=_LONG_TTL)
+            except Exception:
+                year_sessions = []
+            if not isinstance(year_sessions, list):
+                continue
+            filtered = [s for s in year_sessions if s.get("meeting_key") == meeting_key]
+            if filtered:
+                sessions = filtered
+                break
 
     # Fallback for Chinese GP (Meeting 1280) if API is restricted — use real OpenF1 session keys
     if not sessions and meeting_key == 1280:
@@ -352,14 +404,45 @@ def get_sessions(meeting_key: int):
         else:
             status = "upcoming"
 
-        output.append({
+        out_row = {
             "session_key":  s["session_key"],
             "session_name": s["session_name"],
             "session_type": s["session_type"],
             "date_start":   s["date_start"],
             "date_end":     s["date_end"],
             "status":       status,
-        })
+        }
+        if s.get("data_source"):
+            out_row["data_source"] = s["data_source"]
+        output.append(out_row)
+
+    # Last resort: build weekend from FastF1 schedule (OpenF1 + hardcodes gave nothing).
+    if not output:
+        ff_raw = fb.sessions_from_fastf1_meeting(meeting_key, _openf1)
+        for s in ff_raw:
+            ds = s["date_start"].replace("Z", "+00:00")
+            de = s["date_end"].replace("Z", "+00:00")
+            date_start = datetime.fromisoformat(ds)
+            date_end = datetime.fromisoformat(de)
+            if date_start.tzinfo is None:
+                date_start = date_start.replace(tzinfo=timezone.utc)
+            if date_end.tzinfo is None:
+                date_end = date_end.replace(tzinfo=timezone.utc)
+            if date_end < now:
+                status = "completed"
+            elif date_start <= now <= date_end:
+                status = "live"
+            else:
+                status = "upcoming"
+            output.append({
+                "session_key": s["session_key"],
+                "session_name": s["session_name"],
+                "session_type": s["session_type"],
+                "date_start": s["date_start"],
+                "date_end": s["date_end"],
+                "status": status,
+                "data_source": "fastf1",
+            })
 
     return output
 
@@ -370,6 +453,8 @@ def get_sessions(meeting_key: int):
 def get_drivers(session_key: int):
     """Get all drivers for a session with team info."""
     drivers = _openf1("drivers", {"session_key": session_key})
+    if not drivers:
+        drivers = fb.drivers_from_fastf1(session_key, _openf1)
     return [{
         "driver_number":  d["driver_number"],
         "full_name":      d.get("full_name", ""),
@@ -464,6 +549,9 @@ def get_telemetry(
 
         laps_data = _openf1("laps", laps_params)
         if not laps_data:
+            alt = fb.telemetry_from_fastf1(session_key, driver_number, lap, _openf1)
+            if alt:
+                return alt
             return _empty_telemetry()
 
         if lap is None:
@@ -502,11 +590,17 @@ def get_telemetry(
         })
 
         if not car_data:
+            alt = fb.telemetry_from_fastf1(session_key, driver_number, lap, _openf1)
+            if alt:
+                return alt
             return _empty_telemetry()
 
         # Merge by timestamp for accurate alignment
         merged = _merge_telemetry_by_timestamp(car_data, location_data)
         if not merged:
+            alt = fb.telemetry_from_fastf1(session_key, driver_number, lap, _openf1)
+            if alt:
+                return alt
             return _empty_telemetry()
 
         # Sample to ~400 points for smoother track (OpenF1 ~3.7 Hz, 90s lap ≈ 333 raw)
@@ -571,6 +665,76 @@ def _empty_telemetry() -> dict:
     }
 
 
+def _normalize_openf1_driver_stints(stints: list) -> list:
+    """
+    OpenF1 stint rows are often returned out of lap order; sprint data sometimes omits
+    the opening stint (first API row starts at lap > 1). Sort by lap_start, fill
+    lap gaps with UNKNOWN, renumber stint_number 1..n. TyreDegModel.fit skips UNKNOWN.
+    """
+    if not stints:
+        return []
+    raw: list = []
+    for s in stints:
+        try:
+            ls, le = int(s["lap_start"]), int(s["lap_end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if le < ls:
+            continue
+        comp = s.get("compound") or "UNKNOWN"
+        if isinstance(comp, str):
+            comp = comp.upper()
+        else:
+            comp = str(comp).upper()
+        try:
+            sn = int(s.get("stint_number", 0))
+        except (TypeError, ValueError):
+            sn = 0
+        raw.append({
+            "stint_number": sn,
+            "compound": comp,
+            "lap_start": ls,
+            "lap_end": le,
+            "tyre_age_at_start": s.get("tyre_age_at_start", 0),
+        })
+    if not raw:
+        return []
+    raw.sort(key=lambda x: (x["lap_start"], x["stint_number"]))
+    out: list = []
+    need_lap = 1
+    for r in raw:
+        ls, le = r["lap_start"], r["lap_end"]
+        if le < need_lap:
+            continue
+        if ls < need_lap:
+            ls = need_lap
+            if ls > le:
+                continue
+        if ls > need_lap:
+            out.append({
+                "stint_number": len(out) + 1,
+                "compound": "UNKNOWN",
+                "lap_start": need_lap,
+                "lap_end": ls - 1,
+                "laps": ls - need_lap,
+                "tyre_age_at_start": 0,
+                "inferred_opening": True,
+            })
+        out.append({
+            "stint_number": len(out) + 1,
+            "compound": r["compound"],
+            "lap_start": ls,
+            "lap_end": le,
+            "laps": le - ls + 1,
+            "tyre_age_at_start": r.get("tyre_age_at_start", 0),
+            "inferred_opening": False,
+        })
+        need_lap = le + 1
+    for i, row in enumerate(out, 1):
+        row["stint_number"] = i
+    return out
+
+
 # ─── LAPS ─────────────────────────────────────────────────────────────────────
 
 def _lap_duration(lap: dict) -> Optional[float]:
@@ -591,6 +755,9 @@ def get_laps(session_key: int, driver_number: int):
         "session_key": session_key,
         "driver_number": driver_number,
     })
+    if not laps:
+        laps = fb.laps_from_fastf1(session_key, driver_number, _openf1)
+        return laps
     return [{
         "lap_number":   l["lap_number"],
         "lap_duration": _lap_duration(l),
@@ -613,6 +780,8 @@ def get_stints(session_key: int, driver_number: Optional[int] = Query(None)):
     if driver_number is not None:
         params["driver_number"] = driver_number
     stints = _openf1("stints", params)
+    if not stints:
+        stints = fb.stints_from_fastf1(session_key, _openf1, driver_number)
 
     # Group by driver number
     grouped = {}
@@ -629,6 +798,9 @@ def get_stints(session_key: int, driver_number: Optional[int] = Query(None)):
             "tyre_age_at_start": s.get("tyre_age_at_start", 0),
         })
 
+    for dn in list(grouped.keys()):
+        grouped[dn] = _normalize_openf1_driver_stints(grouped[dn])
+
     return grouped
 
 
@@ -643,6 +815,9 @@ def get_result(session_key: int):
         results = []
 
     if not results:
+        results = fb.session_result_from_fastf1(session_key, _openf1)
+
+    if not results:
         return []
 
     # Enrich with driver info
@@ -651,6 +826,9 @@ def get_result(session_key: int):
         driver_map = {d["driver_number"]: d for d in drivers}
     except Exception:
         driver_map = {}
+    if not driver_map:
+        for d in fb.drivers_from_fastf1(session_key, _openf1):
+            driver_map[d["driver_number"]] = d
 
     for r in results:
         d = driver_map.get(r["driver_number"], {})
@@ -992,6 +1170,895 @@ def predict(req: PredictRequest):
 
     _save_cache(cache_key, output)
     return output
+
+
+# ─── STRATEGY ENGINE ──────────────────────────────────────────────────────────
+
+class StrategySimulateRequest(BaseModel):
+    meeting_key: int
+    circuit: str = "Australia"
+    n_sims: int = 30000
+    available_compounds: list[str] = ["SOFT", "MEDIUM", "HARD"]
+    custom_pit_loss: Optional[float] = None
+    custom_total_laps: Optional[int] = None
+    driver_numbers: Optional[list[int]] = None
+    session_type: str = "Race"
+
+
+class StrategyLiveScenarioRequest(BaseModel):
+    """Mid-race strategy with fixed SC/VSC/red flag and gap context."""
+    meeting_key: int
+    circuit: str = "Australia"
+    driver_number: int
+    current_lap: int = 1
+    current_compound: str = "MEDIUM"
+    stint_age: int = 5
+    gap_ahead: float = 2.0
+    gap_behind: float = 2.0
+    safety_car_lap: Optional[int] = None
+    vsc_lap: Optional[int] = None
+    red_flag_lap: Optional[int] = None
+    puncture: bool = False
+    session_type: str = "Race"
+    available_compounds: Optional[list[str]] = None
+    custom_pit_loss: Optional[float] = None
+    custom_total_laps: Optional[int] = None
+
+
+# FIA standard tyre allocation per weekend
+TYRE_ALLOCATION_NORMAL = {"SOFT": 8, "MEDIUM": 3, "HARD": 2}
+TYRE_ALLOCATION_SPRINT = {"SOFT": 6, "MEDIUM": 4, "HARD": 2}
+
+
+def _select_race_or_sprint_session(sessions: list, for_sprint: bool):
+    """Pick main Race or Sprint session (same rules as get_strategy_actual)."""
+    if for_sprint:
+        return next(
+            (s for s in sessions
+             if "sprint" in (s.get("session_name") or "").lower()
+             and "qualifying" not in (s.get("session_name") or "").lower()),
+            None,
+        )
+    return next(
+        (s for s in sessions if (s.get("session_name") or "").strip() == "Race"),
+        None,
+    )
+
+
+def _estimate_sprint_race_total_laps(sessions: list) -> Optional[int]:
+    """Use max lap number from a completed sprint session, else None."""
+    target = _select_race_or_sprint_session(sessions, True)
+    if not target or target.get("status") != "completed":
+        return None
+    sk = target.get("session_key")
+    if not sk:
+        return None
+    try:
+        laps = _openf1("laps", {"session_key": sk})
+    except Exception:
+        laps = []
+    if not isinstance(laps, list) or not laps:
+        return None
+    mx = 0
+    for lap in laps:
+        ln = lap.get("lap_number")
+        if ln is not None and int(ln) > mx:
+            mx = int(ln)
+    return mx if mx >= 5 else None
+
+
+def _fetch_previous_year_stop_profile(
+    circuit_key: int, current_year: int, for_sprint: bool,
+) -> Optional[dict]:
+    """
+    Aggregate stop patterns from last year's race or sprint at this circuit.
+    - Race: 1-stop vs 2-stop vs 3+ (drivers need ≥2 stint rows).
+    - Sprint: 0-stop (single stint) vs 1-stop vs 2+ (sprints are usually no-stop or one-stop).
+    """
+    prev_year = current_year - 1
+    if prev_year < 2020:
+        return None
+    try:
+        meetings = _openf1("meetings", {"year": prev_year, "circuit_key": circuit_key})
+    except Exception:
+        meetings = []
+    if not isinstance(meetings, list) or not meetings:
+        return None
+    mk = meetings[0].get("meeting_key")
+    if not mk:
+        return None
+    try:
+        prev_sessions = _openf1("sessions", {"meeting_key": mk})
+    except Exception:
+        prev_sessions = []
+    if not isinstance(prev_sessions, list):
+        return None
+    target = _select_race_or_sprint_session(prev_sessions, for_sprint)
+    if not target:
+        return None
+    sk = target.get("session_key")
+    if not sk:
+        return None
+    try:
+        raw_stints = _openf1("stints", {"session_key": sk})
+    except Exception:
+        raw_stints = []
+    if not isinstance(raw_stints, list) or not raw_stints:
+        return None
+
+    by_driver: dict[int, list] = {}
+    for st in raw_stints:
+        dn = st["driver_number"]
+        by_driver.setdefault(dn, []).append(st)
+
+    if for_sprint:
+        zero_stop = one_stop = two_plus = 0
+        for rows in by_driver.values():
+            n_stints = len(rows)
+            n_stops = max(0, n_stints - 1)
+            if n_stops > 3:
+                continue
+            if n_stints == 1:
+                zero_stop += 1
+            elif n_stops == 1:
+                one_stop += 1
+            else:
+                two_plus += 1
+
+        sample = zero_stop + one_stop + two_plus
+        if sample < 6:
+            return None
+
+        p0 = round(100.0 * zero_stop / sample, 1)
+        p1 = round(100.0 * one_stop / sample, 1)
+        p2p = round(100.0 * two_plus / sample, 1)
+
+        clamped = False
+        if two_plus >= zero_stop and two_plus >= one_stop and two_plus > 0:
+            dominant_pits = 1
+            clamped = True
+            confidence = (two_plus / sample) * 0.52
+        elif zero_stop > one_stop:
+            dominant_pits = 0
+            confidence = zero_stop / sample
+        elif one_stop > zero_stop:
+            dominant_pits = 1
+            confidence = one_stop / sample
+        else:
+            dominant_pits = 0
+            confidence = (zero_stop / sample) * 0.72
+
+        confidence = float(min(0.95, max(0.35, confidence)))
+        bonus_seconds = float(min(36.0, 3.5 + 40.0 * confidence))
+
+        return {
+            "dominant_pits": dominant_pits,
+            "confidence": round(confidence, 3),
+            "bonus_seconds": round(bonus_seconds, 2),
+            "sample_size": sample,
+            "session_kind": "sprint",
+            "zero_stop_pct": p0,
+            "one_stop_pct": p1,
+            "two_plus_pct": p2p,
+            "two_stop_pct": 0.0,
+            "three_plus_pct": 0.0,
+            "source_year": prev_year,
+            "clamped_from_three_plus": False,
+            "clamped_from_two_plus": clamped,
+            "session_name": target.get("session_name", "Sprint"),
+        }
+
+    one_stop = two_stop = three_plus = 0
+    for rows in by_driver.values():
+        n_stints = len(rows)
+        n_stops = max(0, n_stints - 1)
+        if n_stints < 2:
+            continue
+        if n_stops > 4:
+            continue
+        if n_stops == 1:
+            one_stop += 1
+        elif n_stops == 2:
+            two_stop += 1
+        else:
+            three_plus += 1
+
+    sample = one_stop + two_stop + three_plus
+    if sample < 8:
+        return None
+
+    p1 = round(100.0 * one_stop / sample, 1)
+    p2 = round(100.0 * two_stop / sample, 1)
+    p3 = round(100.0 * three_plus / sample, 1)
+
+    clamped = False
+    if three_plus >= one_stop and three_plus >= two_stop:
+        dominant_pits = 2
+        clamped = three_plus > 0
+        confidence = (three_plus / sample) * 0.55 if clamped else (two_stop / sample)
+    elif one_stop > two_stop:
+        dominant_pits = 1
+        confidence = one_stop / sample
+    elif two_stop > one_stop:
+        dominant_pits = 2
+        confidence = two_stop / sample
+    else:
+        dominant_pits = 2
+        confidence = (one_stop / sample) * 0.72
+
+    confidence = float(min(0.95, max(0.35, confidence)))
+    # Scale so bias can overcome deg-model raw gaps (~10–40s) when the field strongly
+    # favored one stop count last year (confidence = dominant share).
+    bonus_seconds = float(min(42.0, 4.0 + 48.0 * confidence))
+
+    return {
+        "dominant_pits": dominant_pits,
+        "confidence": round(confidence, 3),
+        "bonus_seconds": round(bonus_seconds, 2),
+        "sample_size": sample,
+        "session_kind": "race",
+        "zero_stop_pct": 0.0,
+        "one_stop_pct": p1,
+        "two_stop_pct": p2,
+        "three_plus_pct": p3,
+        "two_plus_pct": 0.0,
+        "source_year": prev_year,
+        "clamped_from_three_plus": clamped,
+        "clamped_from_two_plus": False,
+        "session_name": target.get("session_name", "Race"),
+    }
+
+
+def _fetch_grid_positions(sessions: list, session_type: str) -> dict[int, int]:
+    """Fetch grid positions from the appropriate qualifying session.
+    Returns {driver_number: grid_position}.
+    For Race: use full Qualifying (session_name exactly 'Qualifying', or last Qualifying by date).
+    For Sprint: use Sprint Qualifying (session_name contains 'Sprint' and 'Qualifying')."""
+    all_quali = [s for s in sessions if s.get("session_type") == "Qualifying"]
+    if session_type == "Sprint":
+        quali_sessions = [s for s in all_quali
+                         if "sprint" in (s.get("session_name") or "").lower()]
+    else:
+        quali_sessions = [s for s in all_quali
+                         if (s.get("session_name") or "").strip() == "Qualifying"]
+        if not quali_sessions:
+            quali_sessions = [s for s in all_quali
+                             if "sprint" not in (s.get("session_name") or "").lower()]
+        if len(quali_sessions) > 1:
+            quali_sessions = sorted(quali_sessions,
+                                   key=lambda x: x.get("date_start", ""),
+                                   reverse=True)[:1]
+    for qs in quali_sessions:
+        try:
+            results = _openf1("session_result", {"session_key": qs["session_key"]})
+            if results:
+                return {r["driver_number"]: r.get("position", 22) for r in results}
+        except Exception:
+            pass
+    return {}
+
+
+def _compute_tyre_allocation(meeting_key: int, sessions: list, is_sprint: bool) -> dict:
+    """Compute tyre sets used/remaining per driver from stint data across all sessions."""
+    base_alloc = TYRE_ALLOCATION_SPRINT if is_sprint else TYRE_ALLOCATION_NORMAL
+
+    all_stints = []
+    for s in sessions:
+        sk = s["session_key"]
+        stype = s.get("session_type", "")
+        if stype == "Race":
+            continue
+        try:
+            raw = _openf1("stints", {"session_key": sk})
+            if isinstance(raw, list):
+                all_stints.extend(raw)
+        except Exception:
+            pass
+
+    driver_usage: dict[int, dict[str, int]] = {}
+    for st in all_stints:
+        dn = st["driver_number"]
+        compound = (st.get("compound") or "UNKNOWN").upper()
+        if compound not in base_alloc:
+            continue
+        if st.get("tyre_age_at_start", 0) == 0:
+            if dn not in driver_usage:
+                driver_usage[dn] = {"SOFT": 0, "MEDIUM": 0, "HARD": 0}
+            driver_usage[dn][compound] = driver_usage[dn].get(compound, 0) + 1
+
+    result = {}
+    for dn, usage in driver_usage.items():
+        result[dn] = {}
+        for comp in ["SOFT", "MEDIUM", "HARD"]:
+            allocated = base_alloc.get(comp, 0)
+            used = usage.get(comp, 0)
+            result[dn][comp] = {
+                "allocated": allocated,
+                "used": used,
+                "remaining": max(0, allocated - used),
+            }
+    return result
+
+
+def _fetch_session_stints_laps(sessions: list, driver_map: dict,
+                               session_type: str,
+                               session_name_filter: callable = None) -> list[tuple[dict, dict]]:
+    """
+    Fetch stints + laps from sessions matching session_type.
+
+    session_name_filter: optional callable(session_name) -> bool to filter
+    (e.g. exclude Sprint when we want main Race only).
+    Returns list of (stints_dict, laps_dict) - one per session so lap numbers match.
+    """
+    target_sessions = [s for s in sessions
+                      if s.get("session_type") == session_type
+                      and s.get("status") == "completed"]
+    if session_name_filter is not None:
+        target_sessions = [s for s in target_sessions
+                          if session_name_filter(s.get("session_name") or "")]
+
+    result: list[tuple[dict, dict]] = []
+
+    for sess in target_sessions:
+        sk = sess["session_key"]
+        all_stints: dict[str, list] = {}
+        all_laps: dict[int, list] = {}
+
+        try:
+            raw_stints = _openf1("stints", {"session_key": sk})
+        except Exception:
+            raw_stints = []
+        if isinstance(raw_stints, list):
+            for st in raw_stints:
+                dn = str(st["driver_number"])
+                if dn not in all_stints:
+                    all_stints[dn] = []
+                all_stints[dn].append({
+                    "stint_number": st["stint_number"],
+                    "compound": st.get("compound", "UNKNOWN"),
+                    "lap_start": st["lap_start"],
+                    "lap_end": st["lap_end"],
+                    "tyre_age_at_start": st.get("tyre_age_at_start", 0),
+                })
+
+        for _dn_key in list(all_stints.keys()):
+            all_stints[_dn_key] = _normalize_openf1_driver_stints(all_stints[_dn_key])
+
+        for dn_int in set(int(k) for k in all_stints.keys()):
+            try:
+                raw_laps = _openf1("laps", {
+                    "session_key": sk, "driver_number": dn_int})
+            except Exception:
+                raw_laps = []
+            if isinstance(raw_laps, list) and raw_laps:
+                laps_list = []
+                for l in raw_laps:
+                    dur = l.get("lap_duration")
+                    if dur is None or dur <= 0:
+                        s1 = l.get("duration_sector_1")
+                        s2 = l.get("duration_sector_2")
+                        s3 = l.get("duration_sector_3")
+                        if s1 and s2 and s3:
+                            dur = s1 + s2 + s3
+                    laps_list.append({
+                        "lap_number": l["lap_number"],
+                        "lap_duration": dur,
+                        "s1": l.get("duration_sector_1"),
+                        "s2": l.get("duration_sector_2"),
+                        "s3": l.get("duration_sector_3"),
+                        "is_pit_out": l.get("is_pit_out_lap", False),
+                    })
+                all_laps[dn_int] = laps_list
+
+        if all_stints:
+            result.append((all_stints, all_laps))
+
+    return result
+
+
+def _fetch_degradation_data(sessions: list, driver_map: dict) -> list[tuple[dict, dict]]:
+    """
+    Fetch stints + laps from Practice, Race, and Sprint for deg model.
+
+    Returns list of (stints_dict, laps_dict) per session.
+    Preference order: Practice first, then Race, then Sprint.
+    Practice is preferred when both exist; Race/Sprint fill gaps.
+    """
+    result: list[tuple[dict, dict]] = []
+
+    # 1. Practice (all FP sessions - FP1, FP2, FP3)
+    result.extend(_fetch_session_stints_laps(sessions, driver_map, "Practice"))
+
+    # 2. Main Race (exclude Sprint) - session_name exactly "Race"
+    result.extend(_fetch_session_stints_laps(
+        sessions, driver_map, "Race",
+        session_name_filter=lambda n: n.strip() == "Race"))
+
+    # 3. Sprint (if present)
+    result.extend(_fetch_session_stints_laps(
+        sessions, driver_map, "Race",
+        session_name_filter=lambda n: "sprint" in n.lower() and "qualifying" not in n.lower()))
+
+    return result
+
+
+@app.post("/api/strategy/simulate")
+def strategy_simulate(req: StrategySimulateRequest):
+    """Run tyre strategy Monte Carlo simulation using practice session data."""
+    try:
+        sessions = _openf1("sessions", {"meeting_key": req.meeting_key})
+    except Exception:
+        sessions = []
+
+    driver_map = {}
+    for s in sessions:
+        try:
+            drivers = _openf1("drivers", {"session_key": s["session_key"]})
+            for d in drivers:
+                driver_map[d["driver_number"]] = d
+            if driver_map:
+                break
+        except Exception:
+            pass
+
+    if not driver_map:
+        raise HTTPException(404, "No driver data available for this meeting.")
+
+    grid_positions = _fetch_grid_positions(sessions, req.session_type)
+
+    is_sprint = any(s.get("session_type") == "Sprint" for s in sessions)
+    tyre_alloc = _compute_tyre_allocation(req.meeting_key, sessions, is_sprint)
+
+    data_sources = _fetch_degradation_data(sessions, driver_map)
+
+    deg_model = se.TyreDegModel()
+    drivers_list = [{"driver_number": dn, "full_name": d.get("full_name", ""),
+                     "team_name": d.get("team_name", "")}
+                    for dn, d in driver_map.items()]
+    for stints, laps in data_sources:
+        deg_model.fit(stints, laps, drivers_list)
+
+    sprint_race = req.session_type == "Sprint"
+    sprint_laps: Optional[int] = None
+    if sprint_race:
+        sprint_laps = req.custom_total_laps or _estimate_sprint_race_total_laps(sessions)
+        sprint_laps = sprint_laps if sprint_laps else 24
+    effective_laps = sprint_laps if sprint_race else req.custom_total_laps
+
+    sim = se.StrategySimulator(
+        deg_model=deg_model,
+        circuit=req.circuit,
+        available_compounds=req.available_compounds,
+        custom_pit_loss=req.custom_pit_loss,
+        custom_total_laps=effective_laps,
+        sprint_race=sprint_race,
+    )
+
+    sim_drivers = []
+    for dn, d in driver_map.items():
+        if req.driver_numbers and dn not in req.driver_numbers:
+            continue
+        gp = grid_positions.get(dn, 22)
+        driver_alloc = tyre_alloc.get(dn, {})
+        driver_compounds = []
+        for c in req.available_compounds:
+            info = driver_alloc.get(c)
+            if info is None:
+                driver_compounds.append(c)
+            elif info.get("remaining", 0) > 0:
+                driver_compounds.append(c)
+        # OpenF1 stint tallies often "use up" 8+ softs in FP; that leaves 0–1 compound
+        # with remaining>0. Full races need ≥2 compounds for 1/2-stop; sprints need ≥2 for 1-stop
+        # (0-stop only needs one compound but we keep a full set when in doubt).
+        if not driver_compounds or len(driver_compounds) < 2:
+            driver_compounds = list(req.available_compounds)
+
+        sim_drivers.append({
+            "driver": d.get("full_name", f"Driver {dn}"),
+            "driver_number": dn,
+            "team": d.get("team_name", ""),
+            "team_colour": d.get("team_colour", "5a5a80"),
+            "grid_pos": gp,
+            "available_compounds": driver_compounds,
+            "tyre_allocation": driver_alloc,
+        })
+
+    if not sim_drivers:
+        raise HTTPException(400, "No matching drivers found.")
+
+    circuit_key = None
+    current_year = None
+    for s in sessions:
+        if s.get("circuit_key") is not None:
+            circuit_key = s["circuit_key"]
+        if s.get("year") is not None:
+            current_year = s["year"]
+        if circuit_key is not None and current_year is not None:
+            break
+
+    historical_stop_bias = None
+    historical_stop_profile = None
+    if circuit_key is not None and current_year is not None:
+        profile = _fetch_previous_year_stop_profile(
+            int(circuit_key), int(current_year), req.session_type == "Sprint",
+        )
+        if profile:
+            historical_stop_profile = dict(profile)
+            historical_stop_bias = {
+                "dominant_pits": profile["dominant_pits"],
+                "confidence": profile["confidence"],
+                "bonus_seconds": profile["bonus_seconds"],
+            }
+
+    result = sim.run_monte_carlo(
+        sim_drivers, n_sims=req.n_sims, historical_stop_bias=historical_stop_bias,
+    )
+    result["meeting_key"] = req.meeting_key
+    result["session_type"] = req.session_type
+    result["grid_positions"] = grid_positions
+    result["tyre_allocation"] = {str(k): v for k, v in tyre_alloc.items()}
+    if historical_stop_profile:
+        result.setdefault("meta", {})["historical_stop_profile"] = historical_stop_profile
+    return result
+
+
+@app.post("/api/strategy/live-scenario")
+def strategy_live_scenario(req: StrategyLiveScenarioRequest):
+    """
+    Optimal tyre strategy from current lap with user-defined SC/VSC/red flag/puncture
+    and gaps to cars ahead/behind (undercut/overcut-style adjustments).
+    """
+    try:
+        sessions = _openf1("sessions", {"meeting_key": req.meeting_key})
+    except Exception:
+        sessions = []
+
+    driver_map = {}
+    for s in sessions:
+        try:
+            drivers = _openf1("drivers", {"session_key": s["session_key"]})
+            for d in drivers:
+                driver_map[d["driver_number"]] = d
+            if driver_map:
+                break
+        except Exception:
+            pass
+
+    if not driver_map:
+        raise HTTPException(404, "No driver data available for this meeting.")
+
+    if req.driver_number not in driver_map:
+        raise HTTPException(404, f"Driver #{req.driver_number} not found for this meeting.")
+
+    is_sprint = any(s.get("session_type") == "Sprint" for s in sessions)
+    tyre_alloc = _compute_tyre_allocation(req.meeting_key, sessions, is_sprint)
+
+    data_sources = _fetch_degradation_data(sessions, driver_map)
+    deg_model = se.TyreDegModel()
+    drivers_list = [{"driver_number": dn, "full_name": d.get("full_name", ""),
+                     "team_name": d.get("team_name", "")}
+                    for dn, d in driver_map.items()]
+    for stints, laps in data_sources:
+        deg_model.fit(stints, laps, drivers_list)
+
+    comps = list(req.available_compounds or ["SOFT", "MEDIUM", "HARD"])
+    alloc = tyre_alloc.get(req.driver_number, {})
+    if alloc:
+        filtered = [c for c in comps if alloc.get(c, {}).get("remaining", 1) > 0]
+        if len(filtered) >= 2:
+            comps = filtered
+        # else: keep full comps — same ≥2 compounds rule as strategy_simulate
+
+    live_sprint = req.session_type == "Sprint"
+    live_laps = req.custom_total_laps
+    if live_sprint:
+        live_laps = live_laps or _estimate_sprint_race_total_laps(sessions) or 24
+
+    sim = se.StrategySimulator(
+        deg_model=deg_model,
+        circuit=req.circuit,
+        available_compounds=comps,
+        custom_pit_loss=req.custom_pit_loss,
+        custom_total_laps=live_laps if live_sprint else req.custom_total_laps,
+        sprint_race=live_sprint,
+    )
+
+    total = sim.total_laps
+    if req.current_lap < 1 or req.current_lap > total:
+        raise HTTPException(400, f"current_lap must be between 1 and {total}")
+
+    d = driver_map[req.driver_number]
+    name = d.get("full_name", f"Driver {req.driver_number}")
+
+    out = sim.run_live_scenario(
+        driver=name,
+        current_lap=req.current_lap,
+        current_compound=req.current_compound,
+        stint_age=max(0, req.stint_age),
+        gap_ahead=req.gap_ahead,
+        gap_behind=req.gap_behind,
+        sc_lap=req.safety_car_lap,
+        vsc_lap=req.vsc_lap,
+        red_flag_lap=req.red_flag_lap,
+        puncture=req.puncture,
+        available_compounds=comps,
+    )
+    out["meeting_key"] = req.meeting_key
+    out["session_type"] = req.session_type
+    out["driver_number"] = req.driver_number
+    return out
+
+
+@app.get("/api/strategy/actual/{meeting_key}")
+def get_strategy_actual(meeting_key: int, session_type: str = Query("Race", description="Race or Sprint")):
+    """
+    Fetch actual race/sprint results and strategies for comparison with predictions.
+
+    Returns actual finish positions and stint data when the session is completed.
+    """
+    try:
+        sessions = _openf1("sessions", {"meeting_key": meeting_key})
+    except Exception:
+        sessions = []
+
+    target = _select_race_or_sprint_session(sessions, session_type == "Sprint")
+
+    if not target:
+        return {"available": False, "session_key": None, "drivers": []}
+
+    sk = target["session_key"]
+    try:
+        results = _openf1("session_result", {"session_key": sk})
+    except Exception:
+        results = []
+
+    if not results or not isinstance(results, list):
+        return {"available": False, "session_key": sk, "drivers": []}
+    try:
+        raw_stints = _openf1("stints", {"session_key": sk})
+    except Exception:
+        raw_stints = []
+
+    driver_map = {}
+    try:
+        drivers = _openf1("drivers", {"session_key": sk})
+        driver_map = {d["driver_number"]: d for d in drivers}
+    except Exception:
+        pass
+
+    stints_by_driver = {}
+    for s in raw_stints:
+        dn = s["driver_number"]
+        if dn not in stints_by_driver:
+            stints_by_driver[dn] = []
+        stints_by_driver[dn].append({
+            "stint_number": s.get("stint_number", 0),
+            "compound": (s.get("compound") or "UNKNOWN").upper(),
+            "lap_start": s["lap_start"],
+            "lap_end": s["lap_end"],
+            "tyre_age_at_start": s.get("tyre_age_at_start", 0),
+        })
+    for dn in list(stints_by_driver.keys()):
+        norm = _normalize_openf1_driver_stints(stints_by_driver[dn])
+        stints_by_driver[dn] = [{
+            "compound": (x.get("compound") or "UNKNOWN").upper(),
+            "laps": x["laps"],
+            "lap_start": x["lap_start"],
+            "lap_end": x["lap_end"],
+        } for x in norm]
+
+    drivers_out = []
+    for r in sorted(results, key=lambda x: x.get("position") or 99):
+        dn = r["driver_number"]
+        d = driver_map.get(dn, {})
+        stints = stints_by_driver.get(dn, [])
+        drivers_out.append({
+            "driver_number": dn,
+            "driver": d.get("full_name", f"Driver {dn}"),
+            "position": r.get("position", 99),
+            "stints": stints,
+            "n_stops": max(0, len(stints) - 1),
+        })
+
+    return {
+        "available": True,
+        "session_key": sk,
+        "session_name": target.get("session_name", session_type),
+        "drivers": drivers_out,
+    }
+
+
+@app.get("/api/strategy/tyre-allocation/{meeting_key}")
+def get_tyre_allocation(meeting_key: int):
+    """Get tyre sets used/remaining per driver for a meeting."""
+    try:
+        sessions = _openf1("sessions", {"meeting_key": meeting_key})
+    except Exception:
+        sessions = []
+    is_sprint = any(s.get("session_type") == "Sprint" for s in sessions)
+    alloc = _compute_tyre_allocation(meeting_key, sessions, is_sprint)
+
+    driver_map = {}
+    for s in sessions:
+        try:
+            drivers = _openf1("drivers", {"session_key": s["session_key"]})
+            for d in drivers:
+                driver_map[d["driver_number"]] = d
+            if driver_map:
+                break
+        except Exception:
+            pass
+
+    result = {}
+    for dn, compounds in alloc.items():
+        name = driver_map.get(dn, {}).get("full_name", f"Driver {dn}")
+        result[str(dn)] = {
+            "driver": name,
+            "driver_number": dn,
+            "compounds": compounds,
+        }
+    return {"meeting_key": meeting_key, "is_sprint": is_sprint, "drivers": result}
+
+
+class UndercutRequest(BaseModel):
+    meeting_key: int
+    circuit: str = "Australia"
+    driver_ahead: str
+    driver_behind: str
+    current_gap: float
+    current_lap: int
+    compound_ahead: str = "MEDIUM"
+    compound_behind: str = "MEDIUM"
+    stint_age_ahead: int = 10
+    stint_age_behind: int = 10
+    target_compound: str = "HARD"
+
+
+@app.post("/api/strategy/undercut")
+def strategy_undercut(req: UndercutRequest):
+    """Analyze undercut/overcut/stay-out scenarios between two drivers."""
+    try:
+        sessions = _openf1("sessions", {"meeting_key": req.meeting_key})
+    except Exception:
+        sessions = []
+
+    driver_map = {}
+    for s in sessions:
+        try:
+            drivers = _openf1("drivers", {"session_key": s["session_key"]})
+            for d in drivers:
+                driver_map[d["driver_number"]] = d
+            if driver_map:
+                break
+        except Exception:
+            pass
+
+    data_sources = _fetch_degradation_data(sessions, driver_map)
+
+    deg_model = se.TyreDegModel()
+    drivers_list = [{"driver_number": dn, "full_name": d.get("full_name", ""),
+                     "team_name": d.get("team_name", "")}
+                    for dn, d in driver_map.items()]
+    for stints, laps in data_sources:
+        deg_model.fit(stints, laps, drivers_list)
+
+    calc = se.UndercutCalculator(deg_model, req.circuit)
+    return calc.analyze(
+        driver_ahead=req.driver_ahead,
+        driver_behind=req.driver_behind,
+        current_gap=req.current_gap,
+        current_lap=req.current_lap,
+        compound_ahead=req.compound_ahead,
+        compound_behind=req.compound_behind,
+        stint_age_ahead=req.stint_age_ahead,
+        stint_age_behind=req.stint_age_behind,
+        target_compound=req.target_compound,
+    )
+
+
+@app.get("/api/strategy/deg-model/{meeting_key}")
+def strategy_deg_model(meeting_key: int):
+    """Return fitted tyre degradation curves from practice data."""
+    try:
+        sessions = _openf1("sessions", {"meeting_key": meeting_key})
+    except Exception:
+        sessions = []
+
+    driver_map = {}
+    for s in sessions:
+        try:
+            drivers = _openf1("drivers", {"session_key": s["session_key"]})
+            for d in drivers:
+                driver_map[d["driver_number"]] = d
+            if driver_map:
+                break
+        except Exception:
+            pass
+
+    data_sources = _fetch_degradation_data(sessions, driver_map)
+
+    deg_model = se.TyreDegModel()
+    drivers_list = [{"driver_number": dn, "full_name": d.get("full_name", ""),
+                     "team_name": d.get("team_name", "")}
+                    for dn, d in driver_map.items()]
+    for stints, laps in data_sources:
+        deg_model.fit(stints, laps, drivers_list)
+
+    return {
+        "meeting_key": meeting_key,
+        "curves": deg_model.to_dict(),
+        "driver_base_pace": {k: round(v, 3) for k, v in deg_model.driver_base_pace.items()},
+    }
+
+
+# ─── STRATEGY CHAT (LLM + RAG) ──────────────────────────────────────────────
+
+class StrategyChatRequest(BaseModel):
+    meeting_key: int
+    circuit: str = "Australia"
+    message: str
+    simulation_context: Optional[dict] = None
+    conversation_history: Optional[list] = None
+    driver_focus: Optional[str] = None
+
+
+@app.post("/api/strategy/chat")
+def strategy_chat(req: StrategyChatRequest):
+    """Chat with APEX strategy assistant (Claude + RAG)."""
+    rag = get_rag()
+    llm = get_llm()
+
+    rag_context = rag.query(
+        req.message, n=5, circuit_filter=req.circuit if req.circuit else None)
+
+    response = llm.chat(
+        user_message=req.message,
+        simulation_context=req.simulation_context,
+        rag_context=rag_context,
+        conversation_history=req.conversation_history or [],
+    )
+
+    return {
+        "response": response,
+        "rag_context_used": len(rag_context),
+        "llm_available": llm.available,
+    }
+
+
+class StrategyNarrateRequest(BaseModel):
+    meeting_key: int
+    circuit: str = "Australia"
+    simulation_result: dict
+    driver_focus: Optional[str] = None
+
+
+@app.post("/api/strategy/narrate")
+def strategy_narrate(req: StrategyNarrateRequest):
+    """Generate strategy narration from simulation results."""
+    rag = get_rag()
+    llm = get_llm()
+
+    circuit_query = f"tyre strategy {req.circuit} race"
+    rag_context = rag.query(circuit_query, n=5, circuit_filter=req.circuit)
+
+    narration = llm.narrate_strategy(
+        simulation_result=req.simulation_result,
+        rag_context=rag_context,
+        driver_focus=req.driver_focus,
+    )
+
+    return {
+        "narration": narration,
+        "rag_context_used": len(rag_context),
+        "llm_available": llm.available,
+    }
+
+
+@app.get("/api/strategy/rag-stats")
+def strategy_rag_stats():
+    """Get RAG knowledge base statistics."""
+    rag = get_rag()
+    return rag.get_stats()
 
 
 # ─── LOCATION (raw track outline) ────────────────────────────────────────────

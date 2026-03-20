@@ -343,8 +343,26 @@ export default function TelemetryTab({ sessionKey, drivers, mode }) {
       TELEMETRY AVAILABLE AFTER SESSION
     </div></Card>
   );
-  if (loading) return <Spinner label="Fetching telemetry from OpenF1..."/>;
+  if (loading) return <Spinner label="Fetching telemetry (OpenF1 → FastF1)..."/>;
   if (error) return <ErrorBanner message={error} onRetry={fetchTelemetry}/>;
+
+  const telemetryFailedBoth =
+    sessionKey &&
+    mode !== "upcoming" &&
+    selectedDrivers.length > 0 &&
+    selectedDrivers.every(dn => Object.prototype.hasOwnProperty.call(telemetry, dn) && !(telemetry[dn]?.n_points > 0));
+  if (telemetryFailedBoth) {
+    return (
+      <Card>
+        <div style={{textAlign:"center",padding:"40px",fontFamily:T.fontMono,fontSize:mobile?"11px":"10px",color:T.dim2,letterSpacing:"2px",lineHeight:1.6}}>
+          TELEMETRY NOT AVAILABLE
+          <div style={{fontSize:"9px",marginTop:"12px",opacity:0.85,letterSpacing:"1px"}}>
+            OpenF1 and FastF1 returned no usable telemetry for the selected driver(s) in this session.
+          </div>
+        </div>
+      </Card>
+    );
+  }
 
   const fastestLap = primaryTelem?.lap_time ? primaryTelem.lap_time.toFixed(3) + "s" : "—";
 
@@ -383,7 +401,7 @@ export default function TelemetryTab({ sessionKey, drivers, mode }) {
       <div style={{display:"grid",gridTemplateColumns:mobile?"1fr":"1fr 300px",gap:"16px",marginBottom:"16px"}}>
         <Card style={{padding:"12px"}}>
           <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"8px",flexWrap:mobile?"wrap":"nowrap",gap:mobile?"6px":undefined}}>
-            <SectionHeader title="Track map · OpenF1 GPS"/>
+            <SectionHeader title="Track map · GPS (OpenF1 / FastF1)"/>
             <div style={{display:"flex",gap:"6px"}}>
               <button onClick={togglePlay} style={{padding:mobile?"8px 16px":"5px 16px",fontFamily:T.fontMono,fontSize:mobile?"11px":"9px",
                 letterSpacing:"2px",background:playing?"rgba(232,0,45,0.1)":"rgba(0,230,118,0.08)",

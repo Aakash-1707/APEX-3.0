@@ -3,6 +3,8 @@ import { T, apiFetch, Tag, Card, Spinner, ErrorBanner, useIsMobile } from "./the
 import TelemetryTab from "./TelemetryTab";
 import TyreDegTab from "./TyreDegTab";
 import { QualiPredictionTab, RacePredictionTab } from "./PredictionTabs";
+import StrategyTab from "./StrategyTab";
+import StrategyChat from "./StrategyChat";
 
 // ─── HEADER ───────────────────────────────────────────────────────────────────
 function Header({mode, raceName, mobile}) {
@@ -66,20 +68,32 @@ function RaceSelector({calendar, selectedKey, onSelect}) {
   const modeColor = m => m==="past"?T.green:m==="live"?T.red:T.yellow;
   const modeLabel = m => m==="past"?"HISTORICAL":m==="live"?"LIVE":"UPCOMING";
 
+  const cancelColor = "#9e9e9e";
+
   return(
-    <div ref={ref} style={{position:"relative",marginBottom:"16px"}}>
+    <div ref={ref} style={{position:"relative",marginBottom:"20px"}}>
       <button onClick={()=>setOpen(o=>!o)} style={{
-        display:"flex",alignItems:"center",gap:"12px",padding:"10px 16px",
+        display:"flex",alignItems:"center",gap:"14px",padding:"12px 18px",
         background:T.bg2,border:`1px solid ${open?T.red:T.border2}`,
         borderRadius:T.radius,cursor:"pointer",width:"100%",
         transition:"border-color .15s",outline:"none",textAlign:"left",
-        boxShadow:open?`0 0 0 1px ${T.redDim}`:"none"}}>
-        <div style={{flex:1}}>
-          <div style={{display:"flex",alignItems:"center",gap:"8px"}}>
+        boxShadow:open?`0 0 0 1px ${T.redDim}`:"none",
+        opacity:selected.cancelled?0.88:1}}>
+        <div style={{flex:1,minWidth:0}}>
+          <div style={{display:"flex",alignItems:"center",gap:"8px",flexWrap:"wrap"}}>
             <span style={{fontFamily:T.fontDisplay,fontSize:"14px",fontWeight:700,
-              color:T.text,letterSpacing:"1px"}}>
+              color:selected.cancelled?T.dim2:T.text,letterSpacing:"1px"}}>
               {selected.name?.toUpperCase()}
             </span>
+            {selected.cancelled && (
+              <span style={{fontFamily:T.fontMono,fontSize:"8px",padding:"3px 8px",
+                borderRadius:"3px",letterSpacing:"2px",
+                background:"rgba(158,158,158,0.12)",
+                border:`1px solid ${cancelColor}66`,
+                color:cancelColor}}>
+                CANCELLED
+              </span>
+            )}
             <span style={{fontFamily:T.fontMono,fontSize:"9px",padding:"2px 7px",
               borderRadius:"3px",letterSpacing:"1.5px",
               background:`${modeColor(selected.mode)}11`,
@@ -88,7 +102,7 @@ function RaceSelector({calendar, selectedKey, onSelect}) {
               {modeLabel(selected.mode)}
             </span>
           </div>
-          <div style={{fontFamily:T.fontMono,fontSize:"9px",color:T.dim2,marginTop:"3px",letterSpacing:"1px"}}>
+          <div style={{fontFamily:T.fontMono,fontSize:"9px",color:T.dim2,marginTop:"6px",letterSpacing:"1px",lineHeight:1.4}}>
             {selected.circuit_short_name} · {selected.location} · {new Date(selected.date_start).toLocaleDateString("en-GB",
               {day:"numeric",month:"short",year:"numeric"})}
           </div>
@@ -100,36 +114,45 @@ function RaceSelector({calendar, selectedKey, onSelect}) {
       </button>
 
       {open&&(
-        <div style={{position:"absolute",top:"calc(100% + 6px)",left:0,right:0,zIndex:200,
+        <div style={{position:"absolute",top:"calc(100% + 8px)",left:0,right:0,zIndex:200,
           background:T.bg1,border:`1px solid ${T.border2}`,borderRadius:T.radius,
-          overflow:"hidden",boxShadow:"0 16px 40px rgba(0,0,0,0.6)",maxHeight:"480px",overflowY:"auto"}}>
+          overflow:"hidden",boxShadow:"0 16px 40px rgba(0,0,0,0.6)",maxHeight:"min(72vh,520px)",overflowY:"auto",
+          paddingBottom:"4px"}}>
           {[
             {items:past,label:`■ HISTORICAL — ${past.length} COMPLETE`,color:T.green},
             {items:live,label:`● LIVE`,color:T.red},
             {items:upcoming,label:`◇ UPCOMING — ${upcoming.length} REMAINING`,color:T.yellow},
           ].filter(g=>g.items.length>0).map(group=>(
             <div key={group.label}>
-              <div style={{padding:"8px 12px 4px",fontFamily:T.fontMono,fontSize:"8px",
+              <div style={{padding:"12px 16px 8px",fontFamily:T.fontMono,fontSize:"8px",
                 letterSpacing:"3px",color:group.color,borderBottom:`1px solid ${T.border}`}}>
                 {group.label}
               </div>
               {group.items.map(r=>(
                 <button key={r.meeting_key} onClick={()=>{onSelect(r.meeting_key);setOpen(false);}} style={{
-                  display:"flex",alignItems:"center",gap:"10px",width:"100%",padding:"8px 14px",
+                  display:"flex",alignItems:"center",gap:"12px",width:"100%",padding:"11px 16px",
                   background:r.meeting_key===selectedKey?`${group.color}0a`:"transparent",
                   border:"none",borderBottom:`1px solid ${T.border}`,cursor:"pointer",textAlign:"left",
-                  borderLeft:r.meeting_key===selectedKey?`3px solid ${group.color}`:"3px solid transparent"}}>
+                  borderLeft:r.meeting_key===selectedKey?`3px solid ${group.color}`:"3px solid transparent",
+                  opacity:r.cancelled?0.72:1}}>
                   <span style={{fontFamily:T.fontBody,fontSize:"12px",fontWeight:600,
-                    color:r.meeting_key===selectedKey?T.text:"#aaa",flex:1}}>
+                    color:r.cancelled?T.dim2:(r.meeting_key===selectedKey?T.text:"#aaa"),
+                    flex:1,minWidth:0,textAlign:"left"}}>
                     {r.name}
+                    {r.cancelled ? (
+                      <span style={{display:"block",fontFamily:T.fontMono,fontSize:"8px",letterSpacing:"1.5px",
+                        color:cancelColor,marginTop:"4px"}}>
+                        CANCELLED
+                      </span>
+                    ) : null}
                   </span>
-                  <span style={{fontFamily:T.fontMono,fontSize:"9px",color:T.dim2}}>
+                  <span style={{fontFamily:T.fontMono,fontSize:"9px",color:T.dim2,flexShrink:0}}>
                     {r.circuit_short_name}
                   </span>
-                  <span style={{fontFamily:T.fontMono,fontSize:"9px",color:T.dim2}}>
+                  <span style={{fontFamily:T.fontMono,fontSize:"9px",color:T.dim2,flexShrink:0,minWidth:"52px",textAlign:"right"}}>
                     {new Date(r.date_start).toLocaleDateString("en-GB",{day:"numeric",month:"short"})}
                   </span>
-                  {r.meeting_key===selectedKey&&<span style={{color:group.color}}>✓</span>}
+                  {r.meeting_key===selectedKey&&<span style={{color:group.color,flexShrink:0}}>✓</span>}
                 </button>
               ))}
             </div>
@@ -172,7 +195,7 @@ function TabBar({tab, setTab, sessions, mobile}) {
   if (hasSprint) {
     tabs.push("Sprint Quali Pred", "Sprint Race Pred");
   }
-  tabs.push("Quali Prediction", "Race Prediction");
+  tabs.push("Quali Prediction", "Race Prediction", "Strategy");
 
   return(
     <div style={{display:"flex",borderBottom:`1px solid ${T.border}`,marginBottom:"20px",
@@ -209,6 +232,7 @@ export default function APEX() {
   const [qualiNotReady, setQualiNotReady] = useState(false);
   const [apiOnline, setApiOnline] = useState(null);
   const [lastSourceMode, setLastSourceMode] = useState("auto");
+  const [strategyResult, setStrategyResult] = useState(null);
 
   // Check API health
   useEffect(() => {
@@ -233,22 +257,66 @@ export default function APEX() {
     if (!selectedKey) return;
     setSessions([]); setActiveSession(null); setDrivers([]);
     setPredictions(null); setModelMeta(null); setPredError(null); setQualiNotReady(false);
+    setStrategyResult(null);
 
     apiFetch(`/sessions/${selectedKey}`).then(sess => {
       setSessions(sess);
-      // Auto-select Race session, fall back to last session
-      const race = sess.find(s => s.session_name === "Race");
+      // Prefer main Race (not Sprint); some APIs use session_type only
+      const race =
+        sess.find(s => s.session_name === "Race") ||
+        sess.find(
+          s =>
+            s.session_type === "Race" &&
+            !(s.session_name || "").toLowerCase().includes("sprint")
+        );
       setActiveSession(race || sess[sess.length - 1] || null);
     }).catch(() => {});
   }, [selectedKey]);
 
-  // Load drivers when session changes
+  // Load drivers: try active session first, then any completed session (OpenF1 often has no
+  // driver list for a not-yet-run Race, but Quali/FP do).
   useEffect(() => {
-    if (!activeSession) return;
-    apiFetch(`/drivers/${activeSession.session_key}`)
-      .then(setDrivers)
-      .catch(() => {});
-  }, [activeSession]);
+    if (!sessions.length) {
+      setDrivers([]);
+      return;
+    }
+    if (!activeSession) {
+      setDrivers([]);
+      return;
+    }
+    let cancelled = false;
+    const tryKeys = [];
+    tryKeys.push(activeSession.session_key);
+    const completed = [...sessions]
+      .filter(s => s.status === "completed")
+      .sort((a, b) => new Date(a.date_end || 0) - new Date(b.date_end || 0));
+    for (const s of completed.reverse()) {
+      if (s.session_key != null) tryKeys.push(s.session_key);
+    }
+    for (const s of sessions) {
+      if (s.session_key != null) tryKeys.push(s.session_key);
+    }
+    const uniqueKeys = [...new Set(tryKeys)];
+
+    (async () => {
+      for (const sk of uniqueKeys) {
+        if (cancelled) return;
+        try {
+          const list = await apiFetch(`/drivers/${sk}`);
+          if (Array.isArray(list) && list.length > 0) {
+            if (!cancelled) setDrivers(list);
+            return;
+          }
+        } catch {
+          /* try next session_key */
+        }
+      }
+      if (!cancelled) setDrivers([]);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSession, sessions]);
 
   const runPrediction = useCallback(() => {
     if (!selectedKey || sessions.length === 0) return;
@@ -446,7 +514,23 @@ export default function APEX() {
                 sourceMode={lastSourceMode}
                 qualiNotReady={qualiNotReady}/>
         )}
+        {tab==="Strategy" && (
+          <StrategyTab
+            meetingKey={selectedKey}
+            sessions={sessions}
+            drivers={drivers}
+            circuit={selected?.circuit_short_name || "Australia"}
+            mode={mode}
+            sessionType={activeSession?.session_name?.includes("Sprint") ? "Sprint" : "Race"}
+            strategyResult={strategyResult}
+            onSimResult={setStrategyResult}/>
+        )}
       </div>
+
+      <StrategyChat
+        meetingKey={selectedKey}
+        circuit={selected?.circuit_short_name || "Australia"}
+        simulationResult={strategyResult}/>
     </div>
   );
 }
