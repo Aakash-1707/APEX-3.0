@@ -4,7 +4,9 @@ APEX LLM Service — Claude Strategy Intelligence
 Anthropic Claude integration for F1 strategy narration,
 what-if analysis, and conversational strategy queries.
 
-Requires ANTHROPIC_API_KEY environment variable.
+Supports Anthropic Claude and Google Gemini.
+
+Set `ANTHROPIC_API_KEY` for Claude, or `GEMINI_API_KEY` for Gemini.
 """
 
 import os
@@ -15,6 +17,13 @@ _ANTHROPIC_AVAILABLE = False
 try:
     import anthropic
     _ANTHROPIC_AVAILABLE = True
+except ImportError:
+    pass
+
+_GEMINI_AVAILABLE = False
+try:
+    import google.generativeai as genai
+    _GEMINI_AVAILABLE = True
 except ImportError:
     pass
 
@@ -47,16 +56,35 @@ class LLMService:
 
     def __init__(self):
         self.client = None
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if _ANTHROPIC_AVAILABLE and api_key:
+        self.provider: Optional[str] = None
+        self.model_name: Optional[str] = None
+
+        # Prefer Gemini if provided (user asked to use Gemini for now).
+        gemini_key = os.environ.get("GEMINI_API_KEY")
+        if _GEMINI_AVAILABLE and gemini_key:
             try:
-                self.client = anthropic.Anthropic(api_key=api_key)
+                gemini_model = os.environ.get("APEX_GEMINI_MODEL", "models/gemini-2.0-flash")
+                genai.configure(api_key=gemini_key)
+                self.client = genai.GenerativeModel(model_name=gemini_model)
+                self.provider = "gemini"
+                self.model_name = gemini_model
             except Exception as e:
-                print(f"LLM: Anthropic client init failed: {e}")
+                print(f"LLM: Gemini client init failed: {e}")
+
+        # Fallback to Claude if Gemini isn't available.
+        if self.client is None:
+            api_key = os.environ.get("ANTHROPIC_API_KEY")
+            if _ANTHROPIC_AVAILABLE and api_key:
+                try:
+                    self.client = anthropic.Anthropic(api_key=api_key)
+                    self.provider = "anthropic"
+                    self.model_name = MODEL
+                except Exception as e:
+                    print(f"LLM: Anthropic client init failed: {e}")
 
     @property
     def available(self) -> bool:
-        return self.client is not None
+        return self.client is not None and self.provider is not None
 
     def narrate_strategy(self, simulation_result: dict,
                          rag_context: list[dict] = None,
@@ -100,7 +128,7 @@ class LLMService:
             "key risks, and tactical opportunities."
         )
 
-        return self._call_claude("\n".join(prompt_parts))
+        return self._call_llm("\n".join(prompt_parts))
 
     def chat(self, user_message: str,
              simulation_context: Optional[dict] = None,
@@ -109,7 +137,7 @@ class LLMService:
         """Conversational strategy query."""
         if not self.available:
             return ("APEX Strategy Assistant is offline. "
-                    "Set ANTHROPIC_API_KEY environment variable to enable Claude integration.")
+                    "Set ANTHROPIC_API_KEY or GEMINI_API_KEY to enable LLM integration.")
 
         messages = []
 
@@ -149,7 +177,7 @@ class LLMService:
             )
 
         messages.append({"role": "user", "content": user_content})
-        return self._call_claude_messages(messages)
+        return self._call_llm_messages(messages)
 
     def analyze_undercut(self, undercut_result: dict,
                          rag_context: list[dict] = None) -> str:
@@ -183,7 +211,29 @@ class LLMService:
             for ctx in rag_context[:2]:
                 prompt += f"  - {ctx['text']}\n"
 
-        return self._call_claude(prompt)
+        return self._call_llm(prompt)
+
+    def _call_llm(self, prompt: str) -> str:
+        """Dispatch prompt to the active provider."""
+        if self.provider == "anthropic":
+            return self._call_claude(prompt)
+        if self.provider == "gemini":
+            return self._call_gemini(prompt)
+        return "LLM not available"
+
+    def _call_llm_messages(self, messages: list[dict]) -> str:
+        """Dispatch messages to the active provider."""
+        if self.provider == "anthropic":
+            return self._call_claude_messages(messages)
+        if self.provider == "gemini":
+            transcript = []
+            for msg in messages:
+                role = (msg.get("role") or "user").upper()
+                content = msg.get("content") or ""
+                transcript.append(f"{role}: {content}")
+            prompt = "\n".join(transcript)
+            return self._call_gemini(prompt)
+        return "LLM not available"
 
     def _call_claude(self, prompt: str) -> str:
         try:
@@ -208,6 +258,29 @@ class LLMService:
             return response.content[0].text
         except Exception as e:
             return f"Claude API error: {e}"
+
+    def _call_gemini(self, prompt: str) -> str:
+        """Call Gemini with a single prompt string."""
+        try:
+            # google-generativeai returns a response with `.text` for common models.
+            full_prompt = f"{SYSTEM_PROMPT}\n\n{prompt}"
+            response = self.client.generate_content(full_prompt)
+
+            # Be robust to SDK differences.
+            text = getattr(response, "text", None)
+            if text:
+                return text
+
+            # Fallback: try candidates/parts extraction.
+            candidates = getattr(response, "candidates", None) or []
+            if candidates:
+                parts = getattr(candidates[0], "parts", None) or []
+                if parts:
+                    return getattr(parts[0], "text", None) or str(parts[0])
+
+            return str(response)
+        except Exception as e:
+            return f"Gemini API error: {e}"
 
     def _fallback_narration(self, sim: dict, driver_focus: Optional[str]) -> str:
         """Generate basic narration without Claude."""
@@ -239,9 +312,7 @@ class LLMService:
                 f"consider strategies that benefit from free pit stops.*"
             )
 
-        lines.append(
-            "\n*Enable Claude (ANTHROPIC_API_KEY) for detailed natural language analysis.*"
-        )
+        lines.append("\n*Enable an LLM (ANTHROPIC_API_KEY or GEMINI_API_KEY) for detailed analysis.*")
         return "\n".join(lines)
 
     def _fallback_undercut(self, result: dict) -> str:
@@ -254,7 +325,7 @@ class LLMService:
             f"Current gap: {gap}s | "
             f"Projected final gap: {best.get('final_gap', '?')}s\n"
             f"{'Overtake on lap ' + str(best.get('overtake_lap')) if best.get('overtake_lap') else 'No overtake projected'}\n\n"
-            f"*Enable Claude (ANTHROPIC_API_KEY) for detailed analysis.*"
+            f"*Enable an LLM (ANTHROPIC_API_KEY or GEMINI_API_KEY) for detailed analysis.*"
         )
 
 
@@ -267,7 +338,7 @@ def get_llm() -> LLMService:
     if _llm_instance is None:
         _llm_instance = LLMService()
         if _llm_instance.available:
-            print("LLM: Claude strategy assistant ready")
+            print(f"LLM: {getattr(_llm_instance, 'provider', 'unknown')} strategy assistant ready")
         else:
-            print("LLM: Running without Claude (set ANTHROPIC_API_KEY to enable)")
+            print("LLM: Running without LLM (set ANTHROPIC_API_KEY or GEMINI_API_KEY to enable)")
     return _llm_instance

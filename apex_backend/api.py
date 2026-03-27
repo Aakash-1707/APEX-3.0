@@ -33,6 +33,7 @@ import hashlib
 import httpx
 import time as _time
 from datetime import datetime, timezone
+from urllib.parse import quote_plus
 
 import model_core as mc
 import strategy_engine as se
@@ -41,6 +42,13 @@ from rag_service import get_rag
 from llm_service import get_llm
 
 OPENF1_BASE = "https://api.openf1.org/v1"
+OPENF1_API_KEY = os.environ.get("OPENF1_API_KEY", "").strip()
+OPENF1_USERNAME = os.environ.get("OPENF1_USERNAME", "").strip()
+OPENF1_PASSWORD = os.environ.get("OPENF1_PASSWORD", "").strip()
+
+_OPENF1_ACCESS_TOKEN: Optional[str] = None
+_OPENF1_TOKEN_EXPIRY_TS: float = 0.0
+_OPENF1_AUTH_WARNED: bool = False
 
 app = FastAPI(title="APEX F1 API", version="2.0.0")
 
@@ -90,10 +98,15 @@ def _openf1(endpoint: str, params: dict = None, ttl: int = _DEFAULT_TTL) -> list
 
     url = f"{OPENF1_BASE}/{endpoint}"
     max_retries = 3
+    headers = {"accept": "application/json"}
+    token = _get_openf1_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
     for attempt in range(max_retries):
         try:
             with httpx.Client(timeout=60.0) as client:
-                resp = client.get(url, params=params)
+                resp = client.get(url, params=params, headers=headers)
                 if resp.status_code == 429:
                     wait = 2 ** attempt
                     _time.sleep(wait)
@@ -120,16 +133,77 @@ def _openf1(endpoint: str, params: dict = None, ttl: int = _DEFAULT_TTL) -> list
     return []
 
 
+def _looks_like_jwt(token: str) -> bool:
+    # JWTs generally contain 3 segments separated by dots.
+    return token.count(".") == 2 and len(token) > 30
+
+
+def _fetch_openf1_access_token() -> Optional[str]:
+    global _OPENF1_ACCESS_TOKEN, _OPENF1_TOKEN_EXPIRY_TS
+    if not (OPENF1_USERNAME and OPENF1_PASSWORD):
+        return None
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            resp = client.post(
+                "https://api.openf1.org/token",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                data={"username": OPENF1_USERNAME, "password": OPENF1_PASSWORD},
+            )
+            resp.raise_for_status()
+            data = resp.json() if resp.text else {}
+            token = data.get("access_token")
+            if isinstance(token, str) and token:
+                expires_in = data.get("expires_in")
+                try:
+                    ttl_s = max(60, int(expires_in) - 60) if expires_in is not None else 3000
+                except Exception:
+                    ttl_s = 3000
+                _OPENF1_ACCESS_TOKEN = token
+                _OPENF1_TOKEN_EXPIRY_TS = _time.time() + ttl_s
+                return token
+    except Exception as e:
+        print(f"OpenF1 auth token fetch failed: {e}")
+    return None
+
+
+def _get_openf1_token() -> Optional[str]:
+    global _OPENF1_AUTH_WARNED
+    # If user set a JWT token directly, use it.
+    if OPENF1_API_KEY and _looks_like_jwt(OPENF1_API_KEY):
+        return OPENF1_API_KEY
+
+    # If OPENF1_API_KEY is set but not a JWT, warn once.
+    if OPENF1_API_KEY and not _OPENF1_AUTH_WARNED:
+        print("OpenF1 auth: OPENF1_API_KEY is not a valid JWT access token. "
+              "Use OPENF1_USERNAME/OPENF1_PASSWORD or a real access token.")
+        _OPENF1_AUTH_WARNED = True
+
+    # Use cached OAuth token if still valid.
+    if _OPENF1_ACCESS_TOKEN and _time.time() < _OPENF1_TOKEN_EXPIRY_TS:
+        return _OPENF1_ACCESS_TOKEN
+
+    # Try to fetch a new OAuth token using username/password.
+    return _fetch_openf1_access_token()
+
+
 # ─── PREDICTION + CIRCUIT STATS CACHE ─────────────────────────────────────────
 
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "prediction_cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_CACHE_TABLE = os.environ.get("SUPABASE_CACHE_TABLE", "prediction_cache")
 
-def _prediction_cache_key(meeting_key: int, session_key: Optional[int], race_session_key: Optional[int], n_sims: int, source_mode: str) -> str:
+
+def _prediction_request_key(meeting_key: int, session_key: Optional[int], race_session_key: Optional[int], n_sims: int, source_mode: str) -> str:
     """Include quali + race session + source mode so different inputs get separate caches."""
     raw = f"openf1_{meeting_key}_{session_key or 0}_{race_session_key or 0}_{n_sims}_{source_mode}"
     return hashlib.md5(raw.encode()).hexdigest()
+
+
+def _local_cache_key(request_key: str, data_version: str) -> str:
+    return f"{request_key}_{data_version}"
 
 
 def _load_cache(key: str) -> Optional[dict]:
@@ -144,6 +218,135 @@ def _save_cache(key: str, data: dict):
     path = os.path.join(CACHE_DIR, f"{key}.json")
     with open(path, "w") as f:
         json.dump(data, f)
+
+
+def _supabase_enabled() -> bool:
+    return bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
+
+
+def _supabase_headers() -> dict:
+    return {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+def _load_supabase_cache(request_key: str, data_version: str) -> Optional[dict]:
+    if not _supabase_enabled():
+        return None
+    try:
+        req_q = quote_plus(request_key)
+        ver_q = quote_plus(data_version)
+        table_q = quote_plus(SUPABASE_CACHE_TABLE)
+        url = (
+            f"{SUPABASE_URL}/rest/v1/{table_q}"
+            f"?select=result_json&request_key=eq.{req_q}&data_version=eq.{ver_q}"
+            f"&order=created_at.desc&limit=1"
+        )
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.get(url, headers=_supabase_headers())
+            resp.raise_for_status()
+            rows = resp.json()
+            if rows and isinstance(rows, list):
+                payload = rows[0].get("result_json")
+                if isinstance(payload, dict):
+                    return payload
+    except Exception as e:
+        print(f"Supabase cache read failed: {e}")
+    return None
+
+
+def _save_supabase_cache(request_key: str, data_version: str, data: dict):
+    if not _supabase_enabled():
+        return
+    try:
+        table_q = quote_plus(SUPABASE_CACHE_TABLE)
+        url = f"{SUPABASE_URL}/rest/v1/{table_q}"
+        row = {
+            "request_key": request_key,
+            "data_version": data_version,
+            "result_json": data,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        headers = _supabase_headers()
+        headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.post(url, headers=headers, json=[row])
+            resp.raise_for_status()
+    except Exception as e:
+        print(f"Supabase cache write failed: {e}")
+
+
+def _build_prediction_data_version(
+    meeting_key: int,
+    sessions: list,
+    session_key: Optional[int],
+    race_session_key: Optional[int],
+    source_mode: str,
+) -> str:
+    """
+    Build a stable fingerprint of upstream OpenF1 state relevant to predictions.
+    Any change in session/result snapshots creates a new cache version.
+    """
+    session_snapshots = []
+    for s in sessions:
+        session_snapshots.append({
+            "session_key": s.get("session_key"),
+            "session_name": s.get("session_name"),
+            "session_type": s.get("session_type"),
+            "status": s.get("status"),
+            "date_start": s.get("date_start"),
+            "date_end": s.get("date_end"),
+        })
+    session_snapshots.sort(key=lambda x: (x.get("session_key") or 0))
+
+    tracked_keys = set()
+    if session_key:
+        tracked_keys.add(session_key)
+    if race_session_key:
+        tracked_keys.add(race_session_key)
+    for s in sessions:
+        name = s.get("session_name")
+        if name in {
+            "Qualifying", "Sprint Qualifying", "Sprint Shootout",
+            "Sprint", "Race", "Practice 1", "Practice 2", "Practice 3",
+        }:
+            sk = s.get("session_key")
+            if sk:
+                tracked_keys.add(sk)
+
+    result_snapshots = []
+    for sk in sorted(tracked_keys):
+        try:
+            rows = _openf1("session_result", {"session_key": sk}, ttl=60)
+        except Exception:
+            rows = []
+        if not isinstance(rows, list):
+            rows = []
+        positions = [r.get("position") for r in rows if r.get("position") is not None]
+        durations = []
+        for r in rows:
+            d = r.get("duration")
+            if isinstance(d, (int, float)):
+                durations.append(float(d))
+            elif isinstance(d, list):
+                durations.extend([float(x) for x in d if isinstance(x, (int, float))])
+        result_snapshots.append({
+            "session_key": sk,
+            "n_rows": len(rows),
+            "max_position": max(positions) if positions else None,
+            "duration_checksum": round(sum(durations), 3) if durations else None,
+        })
+
+    version_payload = {
+        "meeting_key": meeting_key,
+        "source_mode": source_mode,
+        "sessions": session_snapshots,
+        "results": result_snapshots,
+    }
+    raw = json.dumps(version_payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.md5(raw.encode()).hexdigest()
 
 
 def _get_circuit_stats_from_openf1(circuit_key: int) -> Optional[dict]:
@@ -252,6 +455,73 @@ def _mark_cancelled_races_after_japan(events: list) -> None:
 @app.get("/api/calendar")
 def get_calendar(year: int = Query(2026)):
     """Fetch race calendar from OpenF1, excluding testing events."""
+    def _compute_fallback_from_fastf1():
+        """Build calendar from FastF1 schedule when OpenF1 meetings are unavailable."""
+        if not getattr(fb, "FASTF1_AVAILABLE", False):
+            return []
+        try:
+            schedule = fb.fastf1.get_event_schedule(year)
+        except Exception:
+            return []
+        if schedule is None or schedule.empty:
+            return []
+
+        now_utc = datetime.now(timezone.utc)
+        out = []
+        for _, row in schedule.iterrows():
+            name = str(row.get("EventName", "") or "")
+            if "testing" in name.lower() or "test" in name.lower():
+                continue
+
+            # Use FastF1 round number to build a stable synthetic meeting key.
+            try:
+                rnd = int(row.get("RoundNumber"))
+            except Exception:
+                rnd = 0
+            meeting_key = int(year) * 100 + max(rnd, 0)
+
+            start_raw = row.get("Session1DateUtc") or row.get("Session1Date") or row.get("EventDate")
+            end_raw = row.get("Session5DateUtc") or row.get("Session5Date") or row.get("EventDate")
+            if start_raw is None or end_raw is None:
+                continue
+
+            ds = datetime.fromisoformat(str(start_raw).replace("Z", "+00:00"))
+            de = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00"))
+            if ds.tzinfo is None:
+                ds = ds.replace(tzinfo=timezone.utc)
+            if de.tzinfo is None:
+                de = de.replace(tzinfo=timezone.utc)
+
+            if de < now_utc:
+                mode = "past"
+            elif ds <= now_utc <= de:
+                mode = "live"
+            else:
+                mode = "upcoming"
+
+            out.append({
+                "meeting_key": meeting_key,
+                "name": name,
+                "official_name": name,
+                "location": str(row.get("Location", "") or ""),
+                "country_code": "",
+                "country_name": str(row.get("Country", "") or ""),
+                "country_flag": "",
+                "circuit_key": None,
+                "circuit_short_name": str(row.get("Location", "") or name),
+                "circuit_type": "",
+                "circuit_image": "",
+                "date_start": ds.isoformat(),
+                "date_end": de.isoformat(),
+                "gmt_offset": "",
+                "year": year,
+                "mode": mode,
+                "cancelled": False,
+                "data_source": "fastf1",
+            })
+        out.sort(key=lambda x: x.get("date_start") or "")
+        return out
+
     def _compute_fallback_2026():
         """Return hardcoded 2026 calendar with dynamically computed modes."""
         now_utc = datetime.now(timezone.utc)
@@ -295,8 +565,12 @@ def get_calendar(year: int = Query(2026)):
     now = datetime.now(timezone.utc)
     output = []
 
-    if not meetings and year == 2026:
-        return _compute_fallback_2026()
+    if not meetings:
+        ff_fallback = _compute_fallback_from_fastf1()
+        if ff_fallback:
+            return ff_fallback
+        if year == 2026:
+            return _compute_fallback_2026()
 
     for m in meetings:
         # Skip pre-season testing
@@ -348,9 +622,114 @@ def get_calendar(year: int = Query(2026)):
 
 # ─── SESSIONS ─────────────────────────────────────────────────────────────────
 
+def _sessions_from_fastf1_round_key(meeting_key: int) -> list[dict]:
+    """
+    Build sessions for synthetic meeting keys produced by FastF1 calendar fallback.
+    meeting_key format: YYYYRR (e.g., 202602 = year 2026, round 2).
+    """
+    if not getattr(fb, "FASTF1_AVAILABLE", False):
+        return []
+    try:
+        year = int(meeting_key) // 100
+        rnd = int(meeting_key) % 100
+    except Exception:
+        return []
+    if year < 2018 or rnd <= 0:
+        return []
+
+    try:
+        schedule = fb.fastf1.get_event_schedule(year)
+    except Exception:
+        return []
+    if schedule is None or schedule.empty:
+        return []
+
+    row = None
+    for _, r in schedule.iterrows():
+        try:
+            if int(r.get("RoundNumber")) == rnd:
+                row = r
+                break
+        except Exception:
+            continue
+    if row is None:
+        return []
+
+    base = 8_000_000_000 + int(meeting_key) * 100
+    now = datetime.now(timezone.utc)
+    out = []
+    slot = 0
+    for i in range(1, 6):
+        sname = row.get(f"Session{i}")
+        sdate = row.get(f"Session{i}DateUtc") or row.get(f"Session{i}Date")
+        if sname is None:
+            continue
+        name = str(sname).strip()
+        if not name or name.lower() == "nan":
+            continue
+        slot += 1
+        sk = base + slot
+        stype = "Practice"
+        nl = name.lower()
+        if "qualifying" in nl or "shootout" in nl:
+            stype = "Qualifying"
+        elif nl == "sprint" or nl == "race":
+            stype = "Race"
+        ff_id = fb.openf1_session_to_ff_identifier(name, stype)
+        if not ff_id:
+            continue
+
+        fb.register_synthetic_session(sk, {
+            "year": year,
+            "gp": rnd,
+            "ff_session": ff_id,
+            "meeting_key": meeting_key,
+            "session_name": name,
+            "session_type": stype,
+        })
+
+        if sdate is None:
+            ds = f"{year}-01-01T00:00:00+00:00"
+        else:
+            ds = sdate.isoformat() if hasattr(sdate, "isoformat") else str(sdate)
+        de = ds
+
+        try:
+            ds_dt = datetime.fromisoformat(ds.replace("Z", "+00:00"))
+            de_dt = datetime.fromisoformat(de.replace("Z", "+00:00"))
+            if ds_dt.tzinfo is None:
+                ds_dt = ds_dt.replace(tzinfo=timezone.utc)
+            if de_dt.tzinfo is None:
+                de_dt = de_dt.replace(tzinfo=timezone.utc)
+            if de_dt < now:
+                status = "completed"
+            elif ds_dt <= now <= de_dt:
+                status = "live"
+            else:
+                status = "upcoming"
+        except Exception:
+            status = "upcoming"
+
+        out.append({
+            "session_key": sk,
+            "session_name": name,
+            "session_type": stype,
+            "date_start": ds,
+            "date_end": de,
+            "status": status,
+            "data_source": "fastf1",
+        })
+
+    return out
+
 @app.get("/api/sessions/{meeting_key}")
 def get_sessions(meeting_key: int):
     """Get all sessions for a meeting (FP1, Quali, Sprint, Race, etc.)."""
+    # Synthetic key path for FastF1 calendar fallback rows (YYYYRR).
+    synthetic_sessions = _sessions_from_fastf1_round_key(meeting_key)
+    if synthetic_sessions:
+        return synthetic_sessions
+
     try:
         sessions = _openf1("sessions", {"meeting_key": meeting_key})
     except Exception:
@@ -374,15 +753,11 @@ def get_sessions(meeting_key: int):
                 sessions = filtered
                 break
 
-    # Fallback for Chinese GP (Meeting 1280) if API is restricted — use real OpenF1 session keys
-    if not sessions and meeting_key == 1280:
-        sessions = [
-            {"session_key": 11235, "session_name": "Practice 1", "session_type": "Practice", "date_start": "2026-03-13T03:30:00+00:00", "date_end": "2026-03-13T04:30:00+00:00"},
-            {"session_key": 11236, "session_name": "Sprint Qualifying", "session_type": "Qualifying", "date_start": "2026-03-13T07:30:00+00:00", "date_end": "2026-03-13T08:14:00+00:00"},
-            {"session_key": 11240, "session_name": "Sprint", "session_type": "Race", "date_start": "2026-03-14T03:00:00+00:00", "date_end": "2026-03-14T04:00:00+00:00"},
-            {"session_key": 11241, "session_name": "Qualifying", "session_type": "Qualifying", "date_start": "2026-03-14T07:00:00+00:00", "date_end": "2026-03-14T08:00:00+00:00"},
-            {"session_key": 11245, "session_name": "Race", "session_type": "Race", "date_start": "2026-03-15T07:00:00+00:00", "date_end": "2026-03-15T09:00:00+00:00"},
-        ]
+    # Prefer FastF1 synthetic sessions when OpenF1 has no sessions for this meeting.
+    if not sessions:
+        ff_raw = fb.sessions_from_fastf1_meeting(meeting_key, _openf1)
+        if ff_raw:
+            sessions = ff_raw
 
     now = datetime.now(timezone.utc)
     output = []
@@ -416,7 +791,7 @@ def get_sessions(meeting_key: int):
             out_row["data_source"] = s["data_source"]
         output.append(out_row)
 
-    # Last resort: build weekend from FastF1 schedule (OpenF1 + hardcodes gave nothing).
+    # Last resort: build weekend from FastF1 schedule if everything above still failed.
     if not output:
         ff_raw = fb.sessions_from_fastf1_meeting(meeting_key, _openf1)
         for s in ff_raw:
@@ -443,6 +818,16 @@ def get_sessions(meeting_key: int):
                 "status": status,
                 "data_source": "fastf1",
             })
+
+    # Final emergency fallback for Chinese GP (legacy OpenF1 keys), only if nothing else worked.
+    if not output and meeting_key == 1280:
+        output = [
+            {"session_key": 11235, "session_name": "Practice 1", "session_type": "Practice", "date_start": "2026-03-13T03:30:00+00:00", "date_end": "2026-03-13T04:30:00+00:00", "status": "completed"},
+            {"session_key": 11236, "session_name": "Sprint Qualifying", "session_type": "Qualifying", "date_start": "2026-03-13T07:30:00+00:00", "date_end": "2026-03-13T08:14:00+00:00", "status": "completed"},
+            {"session_key": 11240, "session_name": "Sprint", "session_type": "Race", "date_start": "2026-03-14T03:00:00+00:00", "date_end": "2026-03-14T04:00:00+00:00", "status": "completed"},
+            {"session_key": 11241, "session_name": "Qualifying", "session_type": "Qualifying", "date_start": "2026-03-14T07:00:00+00:00", "date_end": "2026-03-14T08:00:00+00:00", "status": "completed"},
+            {"session_key": 11245, "session_name": "Race", "session_type": "Race", "date_start": "2026-03-15T07:00:00+00:00", "date_end": "2026-03-15T09:00:00+00:00", "status": "completed"},
+        ]
 
     return output
 
@@ -748,6 +1133,21 @@ def _lap_duration(lap: dict) -> Optional[float]:
     return None
 
 
+def _finite_or_none(v):
+    """Return numeric value if finite, else None (avoids JSON nan/inf errors)."""
+    if v is None:
+        return None
+    try:
+        fv = float(v)
+        if fv != fv:  # nan
+            return None
+        if fv == float("inf") or fv == float("-inf"):
+            return None
+        return fv
+    except Exception:
+        return None
+
+
 @app.get("/api/laps/{session_key}/{driver_number}")
 def get_laps(session_key: int, driver_number: int):
     """Fetch all laps with sector times for a driver."""
@@ -760,13 +1160,13 @@ def get_laps(session_key: int, driver_number: int):
         return laps
     return [{
         "lap_number":   l["lap_number"],
-        "lap_duration": _lap_duration(l),
-        "s1":           l.get("duration_sector_1"),
-        "s2":           l.get("duration_sector_2"),
-        "s3":           l.get("duration_sector_3"),
-        "i1_speed":     l.get("i1_speed"),
-        "i2_speed":     l.get("i2_speed"),
-        "st_speed":     l.get("st_speed"),
+        "lap_duration": _finite_or_none(_lap_duration(l)),
+        "s1":           _finite_or_none(l.get("duration_sector_1")),
+        "s2":           _finite_or_none(l.get("duration_sector_2")),
+        "s3":           _finite_or_none(l.get("duration_sector_3")),
+        "i1_speed":     _finite_or_none(l.get("i1_speed")),
+        "i2_speed":     _finite_or_none(l.get("i2_speed")),
+        "st_speed":     _finite_or_none(l.get("st_speed")),
         "is_pit_out":   l.get("is_pit_out_lap", False),
     } for l in laps]
 
@@ -897,26 +1297,52 @@ def predict(req: PredictRequest):
     - If only practice/sprint quali → estimate grid from best available data
     - If no session data → use driver list with team-based estimates
     """
-    # Check cache first
-    cache_key = _prediction_cache_key(req.meeting_key, req.session_key, req.race_session_key, req.n_sims, req.source_mode)
-    if not req.force_refresh:
-        cached = _load_cache(cache_key)
-        if cached:
-            cached["cached"] = True
-            return cached
-
     # Gather all sessions for this meeting
     try:
         sessions = _openf1("sessions", {"meeting_key": req.meeting_key})
     except Exception:
         sessions = []
+    if not sessions:
+        sessions = _sessions_from_fastf1_round_key(req.meeting_key)
+    if not sessions:
+        sessions = fb.sessions_from_fastf1_meeting(req.meeting_key, _openf1)
+
+    def _drivers_for_session(sk: int) -> list:
+        rows = _openf1("drivers", {"session_key": sk})
+        if not rows:
+            rows = fb.drivers_from_fastf1(sk, _openf1)
+        return rows if isinstance(rows, list) else []
+
+    def _session_result_for_session(sk: int) -> list:
+        rows = _openf1("session_result", {"session_key": sk})
+        if not rows:
+            rows = fb.session_result_from_fastf1(sk, _openf1)
+        return rows if isinstance(rows, list) else []
+
+    request_key = _prediction_request_key(
+        req.meeting_key, req.session_key, req.race_session_key, req.n_sims, req.source_mode
+    )
+    data_version = _build_prediction_data_version(
+        req.meeting_key, sessions, req.session_key, req.race_session_key, req.source_mode
+    )
+    cache_key = _local_cache_key(request_key, data_version)
+
+    # Check cache after computing upstream data fingerprint.
+    if not req.force_refresh:
+        cached = _load_supabase_cache(request_key, data_version)
+        if not cached:
+            cached = _load_cache(cache_key)
+        if cached:
+            cached["cached"] = True
+            cached["data_version"] = data_version
+            return cached
 
     # Get driver info from ANY completed session
     driver_map = {}
     for s in sessions:
         if s.get("status") == "completed" or s.get("session_key") == req.session_key:
             try:
-                drivers = _openf1("drivers", {"session_key": s["session_key"]})
+                drivers = _drivers_for_session(s["session_key"])
                 for d in drivers:
                     driver_map[d["driver_number"]] = d
                 if driver_map:
@@ -928,7 +1354,7 @@ def predict(req: PredictRequest):
     if not driver_map:
         for s in sessions:
             try:
-                drivers = _openf1("drivers", {"session_key": s["session_key"]})
+                drivers = _drivers_for_session(s["session_key"])
                 for d in drivers:
                     driver_map[d["driver_number"]] = d
                 if driver_map:
@@ -1003,7 +1429,7 @@ def predict(req: PredictRequest):
 
     if target_session_key:
         try:
-            quali_results = _openf1("session_result", {"session_key": target_session_key})
+            quali_results = _session_result_for_session(target_session_key)
             if quali_results:
                 prediction_basis = (
                     "qualifying"
@@ -1052,7 +1478,7 @@ def predict(req: PredictRequest):
             if not target:
                 continue
             try:
-                results = _openf1("session_result", {"session_key": target["session_key"]})
+                results = _session_result_for_session(target["session_key"])
                 if results:
                     prediction_basis = f"estimated ({pname})"
                     for r in sorted(results, key=lambda x: x.get("position") or 99):
@@ -1109,7 +1535,7 @@ def predict(req: PredictRequest):
         fp_sessions = [s for s in sessions if s.get("session_type") == "Practice" and s.get("status") == "completed"]
         for fps in fp_sessions:
             fp_key = fps["session_name"].lower().replace("practice ", "fp")
-            fp_results = _openf1("session_result", {"session_key": fps["session_key"]})
+            fp_results = _session_result_for_session(fps["session_key"])
             for fr in fp_results:
                 dn = fr["driver_number"]
                 d = driver_map.get(dn, {})
@@ -1130,7 +1556,7 @@ def predict(req: PredictRequest):
             None,
         )
         if sprint_session:
-            sprint_results = _openf1("session_result", {"session_key": sprint_session["session_key"]})
+            sprint_results = _session_result_for_session(sprint_session["session_key"])
             if isinstance(sprint_results, list) and sprint_results:
                 sprint_pos = {r["driver_number"]: r.get("position", 22) for r in sprint_results}
                 qual_pos = {q["driver_number"]: q["pos"] for q in qualifying if q.get("driver_number") is not None}
@@ -1164,11 +1590,13 @@ def predict(req: PredictRequest):
         "circuit":          req.circuit,
         "n_sims":           req.n_sims,
         "prediction_basis": prediction_basis,
+        "data_version":     data_version,
         **result,
         "cached":           False,
     }
 
     _save_cache(cache_key, output)
+    _save_supabase_cache(request_key, data_version, output)
     return output
 
 
@@ -1589,11 +2017,17 @@ def strategy_simulate(req: StrategySimulateRequest):
         sessions = _openf1("sessions", {"meeting_key": req.meeting_key})
     except Exception:
         sessions = []
+    if not sessions:
+        sessions = _sessions_from_fastf1_round_key(req.meeting_key)
+    if not sessions:
+        sessions = fb.sessions_from_fastf1_meeting(req.meeting_key, _openf1)
 
     driver_map = {}
     for s in sessions:
         try:
             drivers = _openf1("drivers", {"session_key": s["session_key"]})
+            if not drivers:
+                drivers = fb.drivers_from_fastf1(s["session_key"], _openf1)
             for d in drivers:
                 driver_map[d["driver_number"]] = d
             if driver_map:
@@ -1712,11 +2146,17 @@ def strategy_live_scenario(req: StrategyLiveScenarioRequest):
         sessions = _openf1("sessions", {"meeting_key": req.meeting_key})
     except Exception:
         sessions = []
+    if not sessions:
+        sessions = _sessions_from_fastf1_round_key(req.meeting_key)
+    if not sessions:
+        sessions = fb.sessions_from_fastf1_meeting(req.meeting_key, _openf1)
 
     driver_map = {}
     for s in sessions:
         try:
             drivers = _openf1("drivers", {"session_key": s["session_key"]})
+            if not drivers:
+                drivers = fb.drivers_from_fastf1(s["session_key"], _openf1)
             for d in drivers:
                 driver_map[d["driver_number"]] = d
             if driver_map:

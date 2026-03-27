@@ -170,6 +170,11 @@ def resolve_fastf1_context(session_key: int, fetcher) -> Optional[dict]:
     """
     if not FASTF1_AVAILABLE:
         return None
+    # Synthetic session keys created from FastF1 schedule should resolve directly.
+    synthetic = _SYNTHETIC_SESSION_CTX.get(int(session_key))
+    if synthetic:
+        return dict(synthetic)
+
     meta = _openf1_sessions_meta(session_key, fetcher)
     if not meta:
         return None

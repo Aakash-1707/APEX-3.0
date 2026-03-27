@@ -259,19 +259,40 @@ export default function APEX() {
     setPredictions(null); setModelMeta(null); setPredError(null); setQualiNotReady(false);
     setStrategyResult(null);
 
-    apiFetch(`/sessions/${selectedKey}`).then(sess => {
-      setSessions(sess);
+    apiFetch(`/sessions/${selectedKey}`).then(async (sess) => {
+      // If OpenF1 is rate-limited/restricted for a live weekend, auto-fallback
+      // to the latest past meeting that actually has sessions.
+      if ((!Array.isArray(sess) || sess.length === 0) && calendar.length > 0) {
+        const pastCandidates = calendar
+          .filter(r => r.meeting_key !== selectedKey && r.mode === "past")
+          .sort((a, b) => new Date(b.date_end || 0) - new Date(a.date_end || 0));
+
+        for (const c of pastCandidates) {
+          try {
+            const fallbackSess = await apiFetch(`/sessions/${c.meeting_key}`);
+            if (Array.isArray(fallbackSess) && fallbackSess.length > 0) {
+              setSelectedKey(c.meeting_key);
+              setPredError(`Live weekend data is restricted by OpenF1 right now. Switched to ${c.name}.`);
+              return;
+            }
+          } catch {
+            // try next candidate
+          }
+        }
+      }
+
+      setSessions(Array.isArray(sess) ? sess : []);
       // Prefer main Race (not Sprint); some APIs use session_type only
       const race =
-        sess.find(s => s.session_name === "Race") ||
-        sess.find(
+        (Array.isArray(sess) ? sess : []).find(s => s.session_name === "Race") ||
+        (Array.isArray(sess) ? sess : []).find(
           s =>
             s.session_type === "Race" &&
             !(s.session_name || "").toLowerCase().includes("sprint")
         );
-      setActiveSession(race || sess[sess.length - 1] || null);
+      setActiveSession(race || (Array.isArray(sess) ? sess[sess.length - 1] : null) || null);
     }).catch(() => {});
-  }, [selectedKey]);
+  }, [selectedKey, calendar]);
 
   // Load drivers: try active session first, then any completed session (OpenF1 often has no
   // driver list for a not-yet-run Race, but Quali/FP do).
@@ -391,6 +412,7 @@ export default function APEX() {
 
   const selected = calendar.find(r => r.meeting_key === selectedKey);
   const mode = selected?.mode || "upcoming";
+  const hasSessionData = Array.isArray(sessions) && sessions.length > 0;
 
   return(
     <div style={{minHeight:"100vh",background:T.bg0,color:T.text,fontFamily:T.fontBody,overflowX:"hidden"}}>
@@ -444,10 +466,19 @@ export default function APEX() {
         {predError && <ErrorBanner message={predError} onRetry={()=>setSelectedKey(selectedKey)} style={{marginBottom:"16px"}}/>}
 
         <SessionBar sessions={sessions} session={activeSession} setSession={setActiveSession} mobile={mobile}/>
+        {!hasSessionData && selectedKey && (
+          <Card style={{marginBottom:"16px",border:`1px solid ${T.border2}`}}>
+            <div style={{fontFamily:T.fontMono,fontSize:"10px",letterSpacing:"1.5px",color:T.dim2,lineHeight:1.6}}>
+              Session data is unavailable right now.
+              This usually happens when OpenF1 restricts public access during a live session.
+              Select a completed meeting to continue.
+            </div>
+          </Card>
+        )}
         <div style={{display:"flex",alignItems:"center",gap:"10px",marginBottom:"8px",flexWrap:"wrap"}}>
           <button
             onClick={runPrediction}
-            disabled={!selectedKey || sessions.length === 0 || predLoading}
+            disabled={!selectedKey || !hasSessionData || predLoading}
             style={{
               fontFamily:T.fontMono,fontSize:mobile?"11px":"9px",letterSpacing:"2px",
               padding:mobile?"10px 20px":"5px 14px",
@@ -462,17 +493,17 @@ export default function APEX() {
             {predLoading ? "RUNNING..." : "PREDICT"}
           </button>
         </div>
-        <TabBar tab={tab} setTab={setTab} sessions={sessions} mobile={mobile}/>
+        {hasSessionData && <TabBar tab={tab} setTab={setTab} sessions={sessions} mobile={mobile}/>}
 
-        {tab==="Telemetry" && (
+        {hasSessionData && tab==="Telemetry" && (
           <TelemetryTab sessionKey={activeSession?.session_key} drivers={drivers}
             mode={activeSession?.status || mode}/>
         )}
-        {tab==="Tyre Deg" && (
+        {hasSessionData && tab==="Tyre Deg" && (
           <TyreDegTab sessionKey={activeSession?.session_key} drivers={drivers}
             mode={activeSession?.status || mode}/>
         )}
-        {tab==="Sprint Quali Pred" && (
+        {hasSessionData && tab==="Sprint Quali Pred" && (
           predLoading
             ? <Spinner label={`Running ${(100000).toLocaleString()} Monte Carlo simulations...`}/>
             : <QualiPredictionTab
@@ -483,7 +514,7 @@ export default function APEX() {
                 sourceMode={lastSourceMode}
                 qualiNotReady={false}/>
         )}
-        {tab==="Sprint Race Pred" && (
+        {hasSessionData && tab==="Sprint Race Pred" && (
           predLoading
             ? <Spinner label={`Running ${(100000).toLocaleString()} Monte Carlo simulations...`}/>
             : <RacePredictionTab
@@ -493,7 +524,7 @@ export default function APEX() {
                 sourceMode={lastSourceMode}
                 qualiNotReady={qualiNotReady}/>
         )}
-        {tab==="Quali Prediction" && (
+        {hasSessionData && tab==="Quali Prediction" && (
           predLoading
             ? <Spinner label={`Running ${(100000).toLocaleString()} Monte Carlo simulations...`}/>
             : <QualiPredictionTab
@@ -504,7 +535,7 @@ export default function APEX() {
                 sourceMode={lastSourceMode}
                 qualiNotReady={false}/>
         )}
-        {tab==="Race Prediction" && (
+        {hasSessionData && tab==="Race Prediction" && (
           predLoading
             ? <Spinner label={`Running ${(100000).toLocaleString()} Monte Carlo simulations...`}/>
             : <RacePredictionTab
@@ -514,7 +545,7 @@ export default function APEX() {
                 sourceMode={lastSourceMode}
                 qualiNotReady={qualiNotReady}/>
         )}
-        {tab==="Strategy" && (
+        {hasSessionData && tab==="Strategy" && (
           <StrategyTab
             meetingKey={selectedKey}
             sessions={sessions}
